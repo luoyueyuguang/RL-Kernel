@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (c) 2026 RL-Engine Contributors
+# Copyright (c) 2026 Kernel-Align Contributors
 
 import torch
 import time
@@ -36,13 +36,14 @@ def native_sampling(logits, top_k=None, top_p=None, temperature=1.0):
     probs = torch.softmax(logits, dim=-1)
     return torch.multinomial(probs, num_samples=1)
 
-def run_benchmark(args):
+def run_benchmark(args, return_data: bool = False):
     device = device_ctx.device
     dtype = torch.float32
     
     sampler = RL_Sampler().to(device)
     g_sizes = [int(g) for g in args.g_sizes.split(",")]
     results = []
+    raw_metrics = []
 
     logger.info_once(f"Starting Sampling Benchmark on {device}")
     logger.info_once(f"Config: VocabSize={args.vocab_size}, TopK={args.top_k}, TopP={args.top_p}")
@@ -65,7 +66,7 @@ def run_benchmark(args):
         t1 = time.perf_counter()
         native_time = (t1 - t0) * 1000
 
-        # 2. RL-Engine FlashInfer Latency
+        # 2. kernel-align FlashInfer Latency
         torch.cuda.synchronize()
         t2 = time.perf_counter()
         _ = sampler.sample(logits, top_k=args.top_k, top_p=args.top_p)
@@ -73,8 +74,21 @@ def run_benchmark(args):
         t3 = time.perf_counter()
         engine_time = (t3 - t2) * 1000
 
-        speedup = f"{native_time / engine_time:.2f}x"
-        results.append([g, f"{native_time:.2f} ms", f"{engine_time:.2f} ms", speedup])
+        speedup_val = native_time / engine_time
+        speedup_str = f"{speedup_val:.2f}x"
+
+        if return_data:
+            raw_metrics.append({
+                "g": g,
+                "engine_ms": engine_time,
+                "native_ms": native_time,
+                "speedup": speedup_str
+            })
+
+        results.append([g, f"{native_time:.2f} ms", f"{engine_time:.2f} ms", speedup_str])
+    
+    if return_data:
+        return raw_metrics
 
     headers = ["Batch Size (G)", "Native Latency", "RL-Engine (FlashInfer)", "Speedup"]
     print("\n" + "="*80)
@@ -90,4 +104,4 @@ if __name__ == "__main__":
     parser.add_argument("--top-k", type=int, default=50)
     parser.add_argument("--top-p", type=float, default=0.9)
     args = parser.parse_args()
-    run_benchmark(args)
+    run_benchmark(args, return_data=False)

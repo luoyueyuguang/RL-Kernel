@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (c) 2026 RL-Engine Contributors
+# Copyright (c) 2026 Kernel-Align Contributors
 
 import torch
 import time
@@ -9,7 +9,7 @@ from rl_engine.utils.logger import logger
 from rl_engine.kernels.sampling import SamplerBackend as RL_Sampler
 from rl_engine.platforms.device import device_ctx
 
-def run_benchmark(args):
+def run_benchmark(args, return_data: bool = False):
     """
     Standardized Benchmark for RL-Engine GRPO Operators.
     Focuses on VRAM efficiency and Latency.
@@ -21,6 +21,7 @@ def run_benchmark(args):
     
     g_sizes = [int(g) for g in args.g_sizes.split(",")]
     results = []
+    raw_metrics = []
 
     logger.info(f"Starting Benchmark on {device} with dtype {dtype}")
     logger.info(f"Config: SeqLen={args.seq_len}, VocabSize={args.vocab_size}")
@@ -75,26 +76,39 @@ def run_benchmark(args):
             engine_mem = "OOM"
             engine_time = float('inf')
 
-        vram_saved = f"{native_mem - engine_mem:.2f} GB" if isinstance(native_mem, float) and isinstance(engine_mem, float) else "N/A"
-        speedup = f"{native_time / engine_time:.2f}x" if native_time != float('inf') and engine_time != float('inf') else "N/A"
+        vram_diff = native_mem - engine_mem if isinstance(native_mem, float) and isinstance(engine_mem, float) else 0.0
+        vram_saved_str = f"{vram_diff:.2f} GB" if vram_diff > 0 else "N/A"
+        speedup_val = native_time / engine_time if native_time != float('inf') and engine_time != float('inf') else 1.0
+        speedup_str = f"{speedup_val:.2f}x"
+
+
+        if return_data:
+            raw_metrics.append({
+                "g": g,
+                "vram_saved_val": vram_diff,
+                "engine_ms": engine_time,
+                "native_ms": native_time,
+                "speedup": speedup_str
+            })
         
         results.append([
             g, 
             f"{native_mem:.2f} GB" if isinstance(native_mem, float) else "OOM", 
             f"{engine_mem:.2f} GB" if isinstance(engine_mem, float) else "OOM", 
-            vram_saved,
+            vram_saved_str,
             f"{native_time:.2f} ms" if native_time != float('inf') else "N/A", 
             f"{engine_time:.2f} ms" if engine_time != float('inf') else "N/A",
-            speedup
+            speedup_str
         ])
 
         del logits, token_ids
         torch.cuda.empty_cache()
+    
+    # The decision to return data or print a table depends on the pattern.
+    if return_data:
+        return raw_metrics
 
-    headers = [
-        "Group Size (G)", "Native VRAM", "RL-Engine VRAM", "VRAM Saved", 
-        "Native Latency", "RL-Engine Latency", "Speedup"
-    ]
+    headers = ["Group Size (G)", "Native VRAM", "RL-Engine VRAM", "VRAM Saved", "Native Latency", "RL-Engine Latency", "Speedup"]
     
     print("\n" + "="*115)
     print(f"RL-ENGINE GRPO OPERATOR BENCHMARK REPORT")
@@ -116,4 +130,4 @@ if __name__ == "__main__":
                         help="Vocabulary size (Llama-3: 128256, Qwen: 151936)")
     
     args = parser.parse_args()
-    run_benchmark(args)
+    run_benchmark(args, return_data=False)

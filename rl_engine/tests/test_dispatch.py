@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0  
-# Copyright (c) 2026 RL-Engine Contributors
+# Copyright (c) 2026 Kernel-Align Contributors
 
 from rl_engine.utils.logger import logger
 from rl_engine.platforms.device import device_ctx

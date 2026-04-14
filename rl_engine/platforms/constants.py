@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0  
-# Copyright (c) 2026 RL-Engine Contributors
+# Copyright (c) 2026 Kernel-Align Contributors
 
 from enum import Enum
 
