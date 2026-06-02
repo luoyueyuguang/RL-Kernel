@@ -23,6 +23,7 @@ from rl_engine.utils.logger import logger
 
 _BRIDGE_METADATA_KEY = "weight_bridge"
 _SHARED_MEMORY_FORMAT = "python-multiprocessing-shared-memory-v1"
+_CUDA_IPC_FORMAT = "pytorch-cuda-ipc-reduce-tensor-v1"
 _CUDA_VMM_FORMAT = "cuda-vmm-posix-fd-v1"
 _CUDA_VMM_TENSOR_ALIGNMENT = 256
 _SHARED_MEMORY_HAS_TRACK = "track" in inspect.signature(shared_memory.SharedMemory).parameters
@@ -226,8 +227,8 @@ class VLLMIPCWeightUpdateRequestBuilder:
                 f"vLLM IPC tensor set mismatch: missing={missing}, extra={extra}"
             )
 
-        reduce_tensor = self._resolve_reduce_tensor()
-        gpu_uuid = self._gpu_uuid or self._current_gpu_uuid()
+        manifest_ipc_handles = self._manifest_ipc_handles(manifest)
+        gpu_uuid = self._gpu_uuid or self._manifest_gpu_uuid(manifest) or self._current_gpu_uuid()
         names: list[str] = []
         dtype_names: list[str] = []
         shapes: list[list[int]] = []
@@ -257,7 +258,11 @@ class VLLMIPCWeightUpdateRequestBuilder:
             names.append(name)
             dtype_names.append(str(weight.dtype).split(".")[-1])
             shapes.append([int(dim) for dim in weight.shape])
-            ipc_handles.append({gpu_uuid: reduce_tensor(weight)})
+            if manifest_ipc_handles is not None:
+                handle = manifest_ipc_handles[name]
+            else:
+                handle = self._resolve_reduce_tensor()(weight)
+            ipc_handles.append({gpu_uuid: handle})
 
         self._keepalive[manifest.update_id] = keepalive
         return {
@@ -272,6 +277,33 @@ class VLLMIPCWeightUpdateRequestBuilder:
 
     def release(self, update_id: str) -> None:
         self._keepalive.pop(update_id, None)
+
+    def _manifest_ipc_handles(self, manifest: WeightUpdateManifest) -> Optional[dict[str, Any]]:
+        if manifest.transport != "cuda-ipc":
+            return None
+        bridge_metadata = manifest.metadata.get(_BRIDGE_METADATA_KEY)
+        if not isinstance(bridge_metadata, Mapping):
+            return None
+        if bridge_metadata.get("format") != _CUDA_IPC_FORMAT:
+            return None
+        entries = bridge_metadata.get("tensors")
+        if not isinstance(entries, Mapping) or set(entries) != set(manifest.tensors):
+            raise WeightManifestValidationError("vLLM IPC manifest handle mismatch")
+        handles: dict[str, Any] = {}
+        for name, entry in entries.items():
+            if not isinstance(entry, Mapping) or "handle" not in entry:
+                raise WeightManifestValidationError(
+                    f"vLLM IPC manifest is missing handle for tensor {name}"
+                )
+            handles[str(name)] = entry["handle"]
+        return handles
+
+    def _manifest_gpu_uuid(self, manifest: WeightUpdateManifest) -> Optional[str]:
+        bridge_metadata = manifest.metadata.get(_BRIDGE_METADATA_KEY)
+        if not isinstance(bridge_metadata, Mapping):
+            return None
+        gpu_uuid = bridge_metadata.get("gpu_uuid")
+        return str(gpu_uuid) if gpu_uuid else None
 
     def _resolve_reduce_tensor(self) -> Any:
         if self._reduce_tensor_fn is not None:
@@ -2253,20 +2285,31 @@ class CUDAVMMTensorBridge(LocalTensorCopyBridge):
             raise
 
 
-class IPCWeightBridge:
+class IPCWeightBridge(LocalTensorCopyBridge):
     """
-    Guarded placeholder for the legacy CUDA IPC transport.
+    Same-node legacy PyTorch CUDA IPC transport.
 
-    Legacy `cudaIpcOpenMemHandle`/PyTorch `reduce_tensor` handle reconstruction
-    fails on the current WSL2 driver path. Use `CUDAVMMTensorBridge` for the
-    validated same-node CUDA zero-copy path based on VMM POSIX-fd export.
+    Publishing creates a complete CUDA snapshot and stores PyTorch
+    `reduce_tensor` handles in the manifest. Consumers rebuild CUDA tensor
+    aliases from those handles and then use the normal import/ack/reject/release
+    lifecycle. Some WSL2 driver paths can still reject the underlying CUDA IPC
+    handle with `invalid resource handle`; those failures are surfaced as
+    explicit transport blockers instead of synthetic success.
     """
 
     transport = "cuda-ipc"
 
-    def __init__(self, *, source_worker: str = "cuda-training", source_rank: int = 0):
-        del source_worker, source_rank
+    def __init__(
+        self,
+        *,
+        source_worker: str = "cuda-training",
+        source_rank: int = 0,
+        reduce_tensor_fn: Optional[Any] = None,
+    ):
+        super().__init__(source_worker=source_worker, source_rank=source_rank)
+        self._reduce_tensor_fn = reduce_tensor_fn
         self.handle_registry: dict[str, Any] = {}
+        self._ipc_keepalive: dict[str, list[torch.Tensor]] = {}
 
     def publish(
         self,
@@ -2275,56 +2318,231 @@ class IPCWeightBridge:
         weight_version: int,
         metadata: Optional[Mapping[str, Any]] = None,
     ) -> WeightUpdateManifest:
-        del model, weight_version, metadata
-        raise self._unavailable()
+        user_metadata = _validated_manifest_metadata(metadata)
+        if _BRIDGE_METADATA_KEY in user_metadata:
+            raise WeightManifestValidationError(
+                f"metadata key {_BRIDGE_METADATA_KEY!r} is reserved for bridge internals"
+            )
+        if not torch.cuda.is_available():
+            raise WeightBridgeUnavailableError(
+                "CUDA IPC weight bridge is unavailable because CUDA is not available."
+            )
+
+        version = int(weight_version)
+        if version <= self._latest_published_weight_version:
+            raise WeightManifestValidationError(
+                "weight_version must increase monotonically "
+                f"(got {version}, latest {self._latest_published_weight_version})"
+            )
+
+        tensors: dict[str, torch.Tensor] = {}
+        handles: dict[str, Any] = {}
+        reduce_tensor = self._resolve_reduce_tensor()
+        for name, tensor in model.state_dict().items():
+            if not isinstance(tensor, torch.Tensor):
+                continue
+            if tensor.device.type != "cuda":
+                raise WeightBridgeUnavailableError(
+                    "CUDA IPC weight bridge requires CUDA tensors. "
+                    f"Tensor {name} is on {tensor.device}."
+                )
+            snapshot = tensor.detach().clone(memory_format=torch.preserve_format)
+            tensors[name] = snapshot
+            handles[name] = reduce_tensor(snapshot)
+
+        if not tensors:
+            raise WeightManifestValidationError("model state_dict produced no CUDA tensors")
+
+        descriptors = {
+            name: TensorDescriptor.from_tensor(name, tensor) for name, tensor in tensors.items()
+        }
+        update_id = str(uuid.uuid4())
+        manifest = WeightUpdateManifest(
+            update_id=update_id,
+            source_worker=self.source_worker,
+            source_rank=self.source_rank,
+            weight_version=version,
+            transport=self.transport,
+            tensors=descriptors,
+            created_at=time.perf_counter(),
+            metadata={
+                **user_metadata,
+                _BRIDGE_METADATA_KEY: {
+                    "format": _CUDA_IPC_FORMAT,
+                    "device_index": int(torch.cuda.current_device()),
+                    "gpu_uuid": self._current_gpu_uuid(),
+                    "tensors": {
+                        name: {
+                            "handle": handle,
+                        }
+                        for name, handle in handles.items()
+                    },
+                },
+            },
+        )
+        self._updates[manifest.update_id] = _LocalUpdateRecord(
+            manifest=manifest,
+            tensors=tensors,
+        )
+        self._ipc_keepalive[manifest.update_id] = list(tensors.values())
+        self.handle_registry[manifest.update_id] = handles
+        self._latest_published_weight_version = version
+        logger.info(
+            "Published CUDA IPC weight update %s version=%s tensors=%s bytes=%s",
+            manifest.update_id,
+            manifest.weight_version,
+            manifest.tensor_count,
+            manifest.total_nbytes,
+        )
+        return manifest
 
     def import_update(self, manifest: WeightUpdateManifest) -> Mapping[str, torch.Tensor]:
-        del manifest
-        raise self._unavailable()
+        record = self._updates.get(manifest.update_id)
+        if record is None:
+            record = self._attach_cuda_ipc_manifest(manifest)
+        if record.state == "rejected":
+            raise WeightUpdateRejectedError(
+                f"weight update {manifest.update_id} was rejected: {record.rejection_reason}"
+            )
+        if record.state == "released":
+            raise WeightUpdateRejectedError(f"weight update {manifest.update_id} was released")
+
+        self._validate_manifest(record, manifest)
+        record.import_count += 1
+        if record.state == "published":
+            record.state = "imported"
+        return dict(record.tensors)
 
     def export_model_handles(self, model: torch.nn.Module) -> Mapping[str, Any]:
-        del model
-        raise self._unavailable()
+        manifest = self.publish(
+            model,
+            weight_version=self._latest_published_weight_version + 1,
+        )
+        bridge_metadata = manifest.metadata.get(_BRIDGE_METADATA_KEY)
+        if not isinstance(bridge_metadata, Mapping):
+            raise WeightManifestValidationError("CUDA IPC manifest is missing bridge metadata")
+        tensor_metadata = bridge_metadata.get("tensors")
+        if not isinstance(tensor_metadata, Mapping):
+            raise WeightManifestValidationError("CUDA IPC manifest has no tensor handles")
+        return {
+            name: {
+                "handle": entry["handle"],
+                "shape": descriptor.shape,
+                "dtype": descriptor.dtype,
+                "stride": descriptor.stride,
+                "update_id": manifest.update_id,
+            }
+            for name, descriptor in manifest.tensors.items()
+            for entry in [tensor_metadata[name]]
+        }
 
     def import_model_weights(self, ipc_handles: Mapping[str, Any]) -> Mapping[str, torch.Tensor]:
-        del ipc_handles
-        raise self._unavailable()
+        tensors: dict[str, torch.Tensor] = {}
+        for name, info in ipc_handles.items():
+            if not isinstance(info, Mapping) or "handle" not in info:
+                raise WeightManifestValidationError(
+                    f"CUDA IPC handle entry for {name} must be a mapping with a handle"
+                )
+            tensors[name] = self._rebuild_cuda_ipc_tensor(info["handle"])
+        return tensors
 
     def release(self, update_id: str) -> None:
-        del update_id
+        super().release(update_id)
+        self._ipc_keepalive.pop(update_id, None)
+        self.handle_registry.pop(update_id, None)
 
-    def acknowledge(self, update_id: str) -> None:
-        del update_id
-        raise self._unavailable()
-
-    def reject(self, update_id: str, reason: str) -> None:
-        del update_id, reason
-        raise self._unavailable()
-
-    def _unavailable(self) -> WeightBridgeUnavailableError:
-        if torch.cuda.is_available() and torch.cuda.current_device() < 0:
-            return WeightBridgeUnavailableError(
-                "CUDA IPC weight bridge is unavailable because no active CUDA device "
-                "context can be selected."
+    def _attach_cuda_ipc_manifest(self, manifest: WeightUpdateManifest) -> _LocalUpdateRecord:
+        if manifest.transport != self.transport:
+            raise WeightManifestValidationError(
+                f"transport mismatch: expected {self.transport}, got {manifest.transport}"
             )
-        if torch.cuda.is_available() and torch.version.cuda and torch.cuda.device_count() > 0:
-            platform_note = (
-                "Legacy CUDA IPC producer/consumer handle reconstruction has not "
-                "passed on this platform. Use CUDAVMMTensorBridge (`cuda-vmm`) for "
-                "the validated same-node CUDA zero-copy transport."
-            )
-        else:
-            platform_note = ""
         if not torch.cuda.is_available():
-            return WeightBridgeUnavailableError(
-                "CUDA IPC weight bridge is unavailable because CUDA is not available. "
-                "Use LocalTensorCopyBridge for protocol validation."
+            raise WeightBridgeUnavailableError(
+                "CUDA IPC weight bridge is unavailable because CUDA is not available."
             )
-        return WeightBridgeUnavailableError(
-            "Legacy CUDA IPC weight bridge is not production-ready yet. "
-            f"{platform_note} Use SharedMemoryTensorBridge or LocalTensorCopyBridge "
-            "when CUDA VMM is unavailable."
+        bridge_metadata = manifest.metadata.get(_BRIDGE_METADATA_KEY)
+        if not isinstance(bridge_metadata, Mapping):
+            raise WeightManifestValidationError("CUDA IPC manifest is missing bridge metadata")
+        if bridge_metadata.get("format") != _CUDA_IPC_FORMAT:
+            raise WeightManifestValidationError(
+                "CUDA IPC manifest has unsupported metadata format: "
+                f"{bridge_metadata.get('format')}"
+            )
+        entries = bridge_metadata.get("tensors")
+        if not isinstance(entries, Mapping) or set(entries) != set(manifest.tensors):
+            raise WeightManifestValidationError("CUDA IPC manifest handle mismatch")
+
+        tensors: dict[str, torch.Tensor] = {}
+        for name, descriptor in manifest.tensors.items():
+            entry = entries[name]
+            if not isinstance(entry, Mapping) or "handle" not in entry:
+                raise WeightManifestValidationError(
+                    f"CUDA IPC manifest is missing handle for tensor {name}"
+                )
+            tensor = self._rebuild_cuda_ipc_tensor(entry["handle"])
+            actual_descriptor = TensorDescriptor.from_tensor(name, tensor)
+            if actual_descriptor != descriptor:
+                if actual_descriptor.sha256 != descriptor.sha256:
+                    raise WeightManifestValidationError(
+                        f"tensor checksum mismatch for {name}: "
+                        f"expected {descriptor.sha256}, got {actual_descriptor.sha256}"
+                    )
+                raise WeightManifestValidationError(
+                    f"tensor descriptor mismatch for {name}: "
+                    f"expected {descriptor}, got {actual_descriptor}"
+                )
+            tensors[name] = tensor
+
+        record = _LocalUpdateRecord(
+            manifest=manifest,
+            tensors=tensors,
+            state="published",
+            import_count=0,
         )
+        self._updates[manifest.update_id] = record
+        return record
+
+    def _rebuild_cuda_ipc_tensor(self, handle: Any) -> torch.Tensor:
+        if not isinstance(handle, tuple) or len(handle) != 2:
+            raise WeightManifestValidationError("CUDA IPC handle must be a (callable, args) tuple")
+        rebuild, args = handle
+        if not callable(rebuild):
+            raise WeightManifestValidationError("CUDA IPC rebuild entry is not callable")
+        try:
+            list_args = list(args)
+            if len(list_args) > 6:
+                list_args[6] = int(torch.cuda.current_device())
+            tensor = rebuild(*list_args)
+            if not isinstance(tensor, torch.Tensor):
+                raise WeightManifestValidationError(
+                    f"CUDA IPC rebuild returned {type(tensor)!r}, not a torch.Tensor"
+                )
+            return tensor
+        except WeightManifestValidationError:
+            raise
+        except Exception as exc:
+            raise WeightBridgeUnavailableError(
+                "CUDA IPC handle reconstruction failed in this runtime. "
+                "This commonly indicates an unsupported WSL2/driver CUDA IPC path; "
+                "use CUDAVMMTensorBridge (`cuda-vmm`) for same-node zero-copy when "
+                "legacy CUDA IPC is unavailable. "
+                f"Underlying error: {type(exc).__name__}: {exc}"
+            ) from exc
+
+    def _resolve_reduce_tensor(self) -> Any:
+        if self._reduce_tensor_fn is not None:
+            return self._reduce_tensor_fn
+        try:
+            from torch.multiprocessing.reductions import reduce_tensor
+        except ImportError as exc:
+            raise WeightBridgeUnavailableError(
+                "PyTorch CUDA IPC reductions are unavailable in this runtime."
+            ) from exc
+        return reduce_tensor
+
+    def _current_gpu_uuid(self) -> str:
+        device_index = int(torch.cuda.current_device())
+        return str(torch.cuda.get_device_properties(device_index).uuid)
 
 
 def make_weight_bridge(

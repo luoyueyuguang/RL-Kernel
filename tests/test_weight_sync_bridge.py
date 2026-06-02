@@ -469,12 +469,41 @@ def test_shared_memory_manifest_handles_empty_tensors():
     bridge.release(manifest.update_id)
 
 
-def test_cuda_ipc_bridge_remains_blocked_until_snapshot_semantics_are_validated():
+def test_cuda_ipc_bridge_rejects_non_cuda_tensors():
     bridge = IPCWeightBridge()
-    model = _model().to("cuda") if torch.cuda.is_available() else _model()
 
-    with pytest.raises(WeightBridgeUnavailableError, match="not production-ready|unavailable"):
-        bridge.publish(model, weight_version=1)
+    with pytest.raises(
+        WeightBridgeUnavailableError,
+        match="requires CUDA tensors|CUDA is not available",
+    ):
+        bridge.publish(_model(), weight_version=1)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA IPC manifest requires CUDA")
+def test_cuda_ipc_bridge_publishes_manifest_and_tracks_lifecycle():
+    bridge = IPCWeightBridge(
+        reduce_tensor_fn=lambda tensor: ("fake_cuda_ipc_rebuild", (tuple(tensor.shape),))
+    )
+    manifest = bridge.publish(_model().to("cuda"), weight_version=1, metadata={"step": 1})
+
+    try:
+        bridge_metadata = manifest.metadata["weight_bridge"]
+        assert manifest.transport == "cuda-ipc"
+        assert bridge_metadata["format"] == "pytorch-cuda-ipc-reduce-tensor-v1"
+        assert set(bridge_metadata["tensors"]) == set(manifest.tensors)
+        assert bridge_metadata["gpu_uuid"]
+        assert manifest.update_id in bridge._ipc_keepalive  # noqa: SLF001
+
+        imported = bridge.import_update(manifest)
+        assert all(tensor.device.type == "cuda" for tensor in imported.values())
+
+        bridge.acknowledge(manifest.update_id)
+        assert bridge.active_weight_version == 1
+        assert bridge.active_update_id == manifest.update_id
+    finally:
+        bridge.release(manifest.update_id)
+
+    assert manifest.update_id not in bridge._ipc_keepalive  # noqa: SLF001
 
 
 def test_cuda_vmm_bridge_requires_cuda_tensors_before_loading_backend():

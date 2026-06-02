@@ -26,6 +26,7 @@ from rl_engine.executors.bridge import (  # noqa: E402
     LocalTensorCopyBridge,
     SharedMemoryTensorBridge,
     VLLMCUDAVMMExternalStorageAdapter,
+    VLLMIPCWeightUpdateRequestBuilder,
     VLLMWeightInstallAdapter,
     WeightBridgeUnavailableError,
     WeightManifestValidationError,
@@ -260,14 +261,93 @@ def _run_shared_memory(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def _run_cuda_ipc() -> dict[str, Any]:
+    if not torch.cuda.is_available():
+        raise WeightBridgeUnavailableError("CUDA IPC smoke requires torch CUDA availability")
+
     bridge = IPCWeightBridge(source_worker="benchmark-cuda-training", source_rank=0)
-    model = _model(8, 1).to("cuda") if torch.cuda.is_available() else _model(8, 1)
+    model = _model(8, 1).to("cuda")
+    manifest = None
+    imported: dict[str, torch.Tensor] = {}
+    publish_started = time.perf_counter()
+    result: dict[str, Any] | None = None
     try:
-        bridge.publish(model, weight_version=1)
+        manifest = bridge.publish(
+            model,
+            weight_version=1,
+            metadata={"benchmark": "weight_sync_bridge_cuda_ipc"},
+        )
+        publish_finished = time.perf_counter()
+
+        import_started = time.perf_counter()
+        imported = dict(bridge.import_update(manifest))
+        import_finished = time.perf_counter()
+        first_name = next(iter(imported))
+        parent_before = imported[first_name].detach().cpu().flatten()[:4].tolist()
+
+        ack_started = time.perf_counter()
+        bridge.acknowledge(manifest.update_id)
+        ack_finished = time.perf_counter()
+
+        context = mp.get_context("spawn")
+        queue = context.Queue()
+        process_started = time.perf_counter()
+        process = context.Process(target=_cuda_ipc_manifest_child, args=(manifest, queue))
+        process.start()
+        process.join(timeout=30)
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=5)
+            raise WeightBridgeUnavailableError("CUDA IPC child process timed out")
+        if process.exitcode != 0 and queue.empty():
+            raise WeightBridgeUnavailableError(
+                f"CUDA IPC child process exited with {process.exitcode}"
+            )
+        child_result = queue.get(timeout=1)
+        process_finished = time.perf_counter()
+        if child_result.get("status") != "pass":
+            raise WeightBridgeUnavailableError(
+                "CUDA IPC child import failed: "
+                f"{child_result.get('error', child_result.get('type', 'unknown error'))}"
+            )
+
+        torch.cuda.synchronize()
+        parent_after = imported[first_name].detach().cpu().flatten()[:4].tolist()
+        if parent_after == parent_before:
+            raise WeightBridgeUnavailableError(
+                "CUDA IPC child mutation was not visible to the publisher snapshot"
+            )
+
+        release_started = time.perf_counter()
+        bridge.release(manifest.update_id)
+        release_finished = time.perf_counter()
+
+        return {
+            "timestamp": _timestamp(),
+            "candidate_id": "issue-13-candidate-3",
+            "mode": "cuda-ipc",
+            "status": "pass",
+            "environment": _environment(),
+            "tensor_count": manifest.tensor_count,
+            "total_nbytes": manifest.total_nbytes,
+            "publish_ms": (publish_finished - publish_started) * 1000,
+            "import_ms": (import_finished - import_started) * 1000,
+            "ack_ms": (ack_finished - ack_started) * 1000,
+            "release_ms": (release_finished - release_started) * 1000,
+            "active_weight_version": bridge.active_weight_version,
+            "notes": (
+                "Legacy CUDA IPC smoke passed; child process rebuilt manifest handles, "
+                f"mutated {first_name} from {child_result['before']} to "
+                f"{child_result['after']}, and parent observed {parent_before} -> "
+                f"{parent_after}; manifest_attach_process_visible_ms="
+                f"{(process_finished - process_started) * 1000:.4f}"
+            ),
+        }
     except WeightBridgeUnavailableError as exc:
         notes = str(exc)
-    else:
-        notes = "CUDA IPC unexpectedly reported success before production validation."
+    finally:
+        imported.clear()
+        if manifest is not None:
+            bridge.release(manifest.update_id)
 
     return {
         "timestamp": _timestamp(),
@@ -275,15 +355,53 @@ def _run_cuda_ipc() -> dict[str, Any]:
         "mode": "cuda-ipc",
         "status": "blocked",
         "environment": _environment(),
-        "tensor_count": 0,
-        "total_nbytes": 0,
-        "publish_ms": "",
+        "tensor_count": manifest.tensor_count if manifest is not None else 0,
+        "total_nbytes": manifest.total_nbytes if manifest is not None else 0,
+        "publish_ms": (
+            (publish_finished - publish_started) * 1000 if "publish_finished" in locals() else ""
+        ),
         "import_ms": "",
         "ack_ms": "",
         "release_ms": "",
         "active_weight_version": "",
         "notes": notes,
     }
+
+
+def _cuda_ipc_manifest_child(manifest: Any, queue: Any) -> None:
+    consumer = IPCWeightBridge(source_worker="benchmark-rollout", source_rank=1)
+    imported: dict[str, torch.Tensor] = {}
+    tensor = None
+    try:
+        imported = dict(consumer.import_update(manifest))
+        consumer.acknowledge(manifest.update_id)
+        first_name = next(iter(imported))
+        tensor = imported[first_name]
+        before = tensor.detach().cpu().flatten()[:4].tolist()
+        tensor.add_(5)
+        torch.cuda.synchronize()
+        after = tensor.detach().cpu().flatten()[:4].tolist()
+        queue.put(
+            {
+                "status": "pass",
+                "before": before,
+                "after": after,
+                "data_ptr": int(tensor.data_ptr()),
+                "active_weight_version": consumer.active_weight_version,
+            }
+        )
+    except Exception as exc:
+        queue.put(
+            {
+                "status": "blocked",
+                "type": type(exc).__name__,
+                "error": str(exc),
+            }
+        )
+    finally:
+        del tensor
+        imported.clear()
+        consumer.release(manifest.update_id)
 
 
 def _cuda_vmm_manifest_child(manifest: Any, queue: Any) -> None:
@@ -637,6 +755,161 @@ def _run_vllm_cuda_vmm_external_storage(args: argparse.Namespace) -> dict[str, A
     }
 
 
+def _run_vllm_cuda_ipc_hot_update(args: argparse.Namespace) -> dict[str, Any]:
+    if not torch.cuda.is_available():
+        raise WeightBridgeUnavailableError(
+            "vLLM CUDA IPC hot-update smoke requires torch CUDA availability"
+        )
+    model_path = getattr(args, "model", None)
+    if not model_path:
+        raise WeightBridgeUnavailableError(
+            "vLLM CUDA IPC hot-update smoke requires --model pointing to a local model"
+        )
+
+    from vllm import LLM, SamplingParams
+    from vllm.config.weight_transfer import WeightTransferConfig
+
+    def generate(llm: Any) -> dict[str, Any]:
+        output = llm.generate(["Hello"], SamplingParams(max_tokens=4, temperature=0.0))[0]
+        return {
+            "text": output.outputs[0].text,
+            "token_ids": list(output.outputs[0].token_ids),
+        }
+
+    def parameter_specs(model: torch.nn.Module) -> list[dict[str, Any]]:
+        return [
+            {
+                "name": name,
+                "shape": tuple(int(dim) for dim in parameter.shape),
+                "dtype": str(parameter.dtype),
+            }
+            for name, parameter in model.named_parameters()
+        ]
+
+    manifest = None
+    publisher = None
+    builder = None
+    publish_ms: float | str = ""
+    request_ms: float | str = ""
+    update_ms: float | str = ""
+    release_ms: float | str = ""
+    active_weight_version: int | str = ""
+    before: dict[str, Any] | None = None
+    try:
+        llm = LLM(
+            model=model_path,
+            tokenizer=model_path,
+            dtype="float16",
+            max_model_len=64,
+            gpu_memory_utilization=0.25,
+            trust_remote_code=False,
+            enforce_eager=True,
+            weight_transfer_config=WeightTransferConfig(backend="ipc"),
+        )
+        before = generate(llm)
+        specs = llm.llm_engine.apply_model(parameter_specs)[0]
+        state = {
+            spec["name"]: torch.zeros(
+                tuple(spec["shape"]),
+                dtype=_dtype_from_string(spec["dtype"]),
+                device="cuda",
+            ).contiguous()
+            for spec in specs
+        }
+
+        publisher = IPCWeightBridge(source_worker="benchmark-training", source_rank=0)
+        publish_started = time.perf_counter()
+        manifest = publisher.publish(
+            _StateDictModule(state),
+            weight_version=args.weight_version,
+            metadata={"benchmark": "vllm_cuda_ipc_hot_update"},
+        )
+        publish_finished = time.perf_counter()
+        publish_ms = (publish_finished - publish_started) * 1000
+
+        imported = dict(publisher.import_update(manifest))
+        builder = VLLMIPCWeightUpdateRequestBuilder(is_checkpoint_format=False)
+        request_started = time.perf_counter()
+        request = builder(manifest, imported)
+        request_finished = time.perf_counter()
+        request_ms = (request_finished - request_started) * 1000
+
+        llm.init_weight_transfer_engine({"init_info": {}})
+        update_started = time.perf_counter()
+        llm.update_weights(request)
+        update_finished = time.perf_counter()
+        update_ms = (update_finished - update_started) * 1000
+        active_weight_version = manifest.weight_version
+
+        after = generate(llm)
+        if before == after:
+            raise RuntimeError("vLLM generation did not change after CUDA IPC hot update")
+
+        release_started = time.perf_counter()
+        if builder is not None and manifest is not None:
+            builder.release(manifest.update_id)
+        if publisher is not None and manifest is not None:
+            publisher.release(manifest.update_id)
+        release_finished = time.perf_counter()
+        release_ms = (release_finished - release_started) * 1000
+
+        result = {
+            "timestamp": _timestamp(),
+            "candidate_id": "issue-13-candidate-11",
+            "mode": "vllm-cuda-ipc-hot-update",
+            "status": "pass",
+            "environment": _environment() + f";vllm_model={model_path}",
+            "tensor_count": manifest.tensor_count,
+            "total_nbytes": manifest.total_nbytes,
+            "publish_ms": publish_ms,
+            "import_ms": update_ms,
+            "ack_ms": "",
+            "release_ms": release_ms,
+            "active_weight_version": active_weight_version,
+            "notes": (
+                "Real vLLM IPC public update_weights path accepted CUDA IPC handles "
+                f"for {manifest.tensor_count} kernel-format parameters and generation "
+                f"changed from token_ids={before['token_ids']} to token_ids={after['token_ids']}."
+            ),
+        }
+        return result
+    except Exception as exc:
+        release_started = time.perf_counter()
+        if builder is not None and manifest is not None:
+            builder.release(manifest.update_id)
+        if publisher is not None and manifest is not None:
+            publisher.release(manifest.update_id)
+        release_finished = time.perf_counter()
+        release_ms = (release_finished - release_started) * 1000
+
+        result = {
+            "timestamp": _timestamp(),
+            "candidate_id": "issue-13-candidate-11",
+            "mode": "vllm-cuda-ipc-hot-update",
+            "status": "blocked",
+            "environment": _environment() + f";vllm_model={model_path}",
+            "tensor_count": manifest.tensor_count if manifest is not None else 0,
+            "total_nbytes": manifest.total_nbytes if manifest is not None else 0,
+            "publish_ms": publish_ms,
+            "import_ms": update_ms,
+            "ack_ms": request_ms,
+            "release_ms": release_ms,
+            "active_weight_version": active_weight_version,
+            "notes": (
+                "Real vLLM IPC hot-update path did not complete. "
+                f"before_token_ids={before['token_ids'] if before else 'unavailable'}; "
+                f"error={type(exc).__name__}: {exc}"
+            ),
+        }
+        return result
+    finally:
+        if result is None:
+            if builder is not None and manifest is not None:
+                builder.release(manifest.update_id)
+            if publisher is not None and manifest is not None:
+                publisher.release(manifest.update_id)
+
+
 def _dtype_from_string(value: str) -> torch.dtype:
     dtype = getattr(torch, value.removeprefix("torch."), None)
     if not isinstance(dtype, torch.dtype):
@@ -694,6 +967,7 @@ def main() -> None:
             "cuda-vmm-rollout-update",
             "rollout-update",
             "runtime-blockers",
+            "vllm-cuda-ipc-hot-update",
             "vllm-cuda-vmm-external-storage",
         ],
         default="local",
@@ -726,6 +1000,8 @@ def main() -> None:
         row = _run_cuda_vmm_rollout_update(args)
     elif args.mode == "rollout-update":
         row = _run_rollout_update(args)
+    elif args.mode == "vllm-cuda-ipc-hot-update":
+        row = _run_vllm_cuda_ipc_hot_update(args)
     elif args.mode == "vllm-cuda-vmm-external-storage":
         row = _run_vllm_cuda_vmm_external_storage(args)
     else:
