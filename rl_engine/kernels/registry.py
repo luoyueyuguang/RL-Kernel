@@ -84,26 +84,34 @@ class KernelRegistry:
         self._adjust_priority_for_hardware()
 
     def _adjust_priority_for_hardware(self):
-        """
-        Probe NVIDIA Compute Capability; if >= 90,
-        inject the fused logp operator with the highest priority.
-        """
-        if device_ctx.device_type == "cuda":
-            try:
-                import torch
+        """Prioritize the fused TMA LogP kernel only when it is compiled into the
+        extension and the device is TMA-capable (SM90/100/120)."""
+        if device_ctx.device_type != "cuda":
+            return
+        try:
+            import torch
 
-                cc_major, cc_minor = torch.cuda.get_device_capability()
-                cc = cc_major * 10 + cc_minor
-                if cc >= 90:
-                    logger.info(
-                        f"Detected Advanced Architecture (SM{cc}). "
-                        "Enabling TMA & Warp Specialization."
-                    )
-                    logp_list = self._priority_map["cuda"]["logp"]
-                    if OpBackend.CUDA_FUSED_LOGP_SM90 not in logp_list:
-                        logp_list.insert(0, OpBackend.CUDA_FUSED_LOGP_SM90)
-            except Exception as e:
-                logger.warning(f"Failed to probe device capability: {e}")
+            from rl_engine.kernels.ops.base import _C, _EXT_AVAILABLE
+
+            cc_major, cc_minor = torch.cuda.get_device_capability()
+            cc = cc_major * 10 + cc_minor
+            tma_compiled = _EXT_AVAILABLE and hasattr(_C, "fused_logp_sm90")
+
+            if tma_compiled and cc_major in (9, 10, 12):
+                logger.info(
+                    f"Detected TMA-capable architecture (SM{cc}); "
+                    "prioritizing fused TMA LogP kernel."
+                )
+                logp_list = self._priority_map["cuda"]["logp"]
+                if OpBackend.CUDA_FUSED_LOGP_SM90 not in logp_list:
+                    logp_list.insert(0, OpBackend.CUDA_FUSED_LOGP_SM90)
+            elif cc >= 90:
+                logger.debug(
+                    f"SM{cc}: fused TMA LogP kernel not compiled into _C; "
+                    "using generic fused kernel."
+                )
+        except Exception as e:
+            logger.warning(f"Failed to probe device capability: {e}")
 
     def get_op(self, op_type: str) -> Any:
         """Core distribution logic: Automatically select the best operator

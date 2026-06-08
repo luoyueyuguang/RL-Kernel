@@ -60,7 +60,7 @@ def get_extensions():
             "csrc/cuda/attention/prefix_shared_attention.cu",
         ]
 
-        cc_major, _ = torch.cuda.get_device_capability()
+        cc_major, cc_minor = torch.cuda.get_device_capability()
         nvcc_flags = ["-O3", "--use_fast_math", "-Xfatbin", "-compress-all"]
         nvcc_flags.extend(
             _cuda_define_from_env(
@@ -111,10 +111,11 @@ def get_extensions():
         extra_link_args = []
 
         tma_src = "csrc/cuda/fused_logp_sm90.cu"
-        enable_sm90 = cc_major >= 9 or os.environ.get("KERNEL_ALIGN_FORCE_SM90") == "1"
+        enable_sm90 = os.environ.get("KERNEL_ALIGN_FORCE_SM90") == "1"
         if enable_sm90 and os.path.exists(tma_src):
+            tma_arch = f"{cc_major}{cc_minor}a"
             cuda_sources.append(tma_src)
-            nvcc_flags.append("-gencode=arch=compute_90a,code=sm_90a")
+            nvcc_flags.append(f"-gencode=arch=compute_{tma_arch},code=sm_{tma_arch}")
             cxx_flags.append("-DKERNEL_ALIGN_WITH_SM90")
             extra_link_args.append("-lcuda")
 
