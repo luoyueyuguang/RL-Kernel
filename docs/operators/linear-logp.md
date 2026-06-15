@@ -47,7 +47,7 @@ is built with `KERNEL_ALIGN_FORCE_SM90=1` on an SM90 device (TMA/`sm_90a`), and
 the registry only selects it when `cc_major == 9` and the symbol is present. The
 forward kernel requires bf16 hidden/weight with `D % 32 == 0`; for any other input
 the op transparently falls back to the Triton (else native) backend. The backward
-reuses the deterministic chunked path. The native op materializes the full `[N, V]` 
+reuses the deterministic chunked path. The native op materializes the full `[N, V]`
 logits and is the correctness oracle.
 
 ## Tensor Contract
