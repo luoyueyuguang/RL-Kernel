@@ -40,9 +40,7 @@ class FakeReferenceModel(torch.nn.Module):
         self.generation_config_use_cache_calls.append(
             getattr(self.generation_config, "use_cache", None)
         )
-        self.attn_implementation_calls.append(
-            getattr(self.config, "_attn_implementation", None)
-        )
+        self.attn_implementation_calls.append(getattr(self.config, "_attn_implementation", None))
         return SimpleNamespace(
             logits=self.fixed_logits[: input_ids.shape[0], : input_ids.shape[1]],
             past_key_values=None,
