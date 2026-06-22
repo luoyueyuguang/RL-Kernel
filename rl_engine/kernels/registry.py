@@ -45,6 +45,9 @@ class OpBackend(Enum, metaclass=_KernelEnumMeta):
     TRITON_GENERIC = "rl_engine.kernels.ops.triton.generic.TritonOp"
     PYTORCH_NATIVE = "rl_engine.kernels.ops.pytorch.loss.logp.NativeLogpOp"
 
+    # WS1 pure-PyTorch ground-truth embedding ops 
+    PYTORCH_NATIVE_EMBEDDING = "rl_engine.kernels.ops.pytorch.linear.embedding.NativeEmbeddingOp"
+
 
 class KernelRegistry:
     """
@@ -79,6 +82,7 @@ class KernelRegistry:
                 "attn": [OpBackend.FLASH_ATTN, OpBackend.TRITON_GENERIC, OpBackend.PYTORCH_NATIVE],
                 "grpo_loss": [OpBackend.TRITON_GRPO_LOSS, OpBackend.PYTORCH_GRPO_LOSS],
                 "ratio_kl": [OpBackend.TRITON_RATIO_KL, OpBackend.PYTORCH_RATIO_KL],
+                "embedding": [OpBackend.PYTORCH_NATIVE_EMBEDDING],
                 # Default dispatch logic for new operators
             },
             "rocm": {
@@ -86,12 +90,14 @@ class KernelRegistry:
                 "attn": [OpBackend.TRITON_GENERIC, OpBackend.PYTORCH_NATIVE],
                 "grpo_loss": [OpBackend.TRITON_GRPO_LOSS, OpBackend.PYTORCH_GRPO_LOSS],
                 "ratio_kl": [OpBackend.TRITON_RATIO_KL, OpBackend.PYTORCH_RATIO_KL],
+                "embedding": [OpBackend.PYTORCH_NATIVE_EMBEDDING],
             },
             "cpu": {
                 "logp": [OpBackend.PYTORCH_NATIVE],
                 "attn": [OpBackend.PYTORCH_NATIVE],
                 "grpo_loss": [OpBackend.PYTORCH_GRPO_LOSS],
                 "ratio_kl": [OpBackend.PYTORCH_RATIO_KL],
+                "embedding": [OpBackend.PYTORCH_NATIVE_EMBEDDING],
             },
         }
         logger.info(f"KernelRegistry initialized for {device_ctx.device_type}")
