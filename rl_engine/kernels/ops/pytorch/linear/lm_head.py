@@ -33,7 +33,7 @@ class NativeLMHeadOp:
     op_class = "reduction"
 
     def __init__(self) -> None:
-        pass
+        """No state; the op is a pure function over (hidden, weight, bias)."""
 
     def __call__(
         self,
@@ -42,6 +42,7 @@ class NativeLMHeadOp:
         *,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        """Alias for ``forward`` so the op is callable like a module."""
         return self.forward(hidden, weight, bias=bias)
 
     def forward(
@@ -83,6 +84,7 @@ class NativeLMHeadOp:
         compute_dtype: torch.dtype,
         output_dtype: torch.dtype,
     ) -> torch.Tensor:
+        """Core matmul: cast to ``compute_dtype``, project, optionally add bias, cast out."""
         h = hidden.to(compute_dtype)
         w = weight.to(compute_dtype)
         # [..., hidden] @ [hidden, vocab] -> [..., vocab]; weight is [vocab, hidden] (HF [out, in]).

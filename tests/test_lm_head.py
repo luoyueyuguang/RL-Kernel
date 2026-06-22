@@ -46,6 +46,29 @@ _QWEN3_HIDDEN = 4096
 _DTYPE_REL_PEAK = {torch.bfloat16: 1.0e-2, torch.float16: 2.0e-3}
 
 
+def _cpu_fp16_matmul_supported() -> bool:
+    """Probe whether this CPU backend implements float16 matmul."""
+    try:
+        _ = torch.randn(2, 2, dtype=torch.float16) @ torch.randn(2, 2, dtype=torch.float16)
+        return True
+    except RuntimeError:
+        return False
+
+
+# CPU half-precision matmul is backend/ISA-dependent (AVX512_FP16, AMX) and may
+# be unimplemented on some runners -- gate the fp16 axis so a missing kernel
+# skips rather than fails the test.
+_FP16_IF_CPU_MATMUL_SUPPORTED = pytest.param(
+    torch.float16,
+    marks=pytest.mark.skipif(
+        not _cpu_fp16_matmul_supported(),
+        reason="CPU float16 matmul unsupported on this backend",
+    ),
+)
+_DTYPES_AXIS_B = (torch.bfloat16, _FP16_IF_CPU_MATMUL_SUPPORTED)
+_DTYPES_AXIS_A = (torch.float32, torch.bfloat16, _FP16_IF_CPU_MATMUL_SUPPORTED)
+
+
 @contextlib.contextmanager
 def _single_thread():
     """Pin CPU GEMM to one thread so the K reduction order is M-independent."""
@@ -59,11 +82,13 @@ def _single_thread():
 
 # Shared helpers -- fixed-seed Generator for determinism / reproducibility.
 def _rand_hidden(batch, seq, hidden=_HIDDEN, *, seed, dtype=torch.float32):
+    """Fixed-seed random hidden-state tensor for reproducibility."""
     gen = torch.Generator().manual_seed(seed)
     return torch.randn(batch, seq, hidden, generator=gen, dtype=dtype)
 
 
 def _rand_weight(vocab=_VOCAB, hidden=_HIDDEN, *, seed, dtype=torch.float32):
+    """Fixed-seed random lm_head weight tensor for reproducibility."""
     gen = torch.Generator().manual_seed(seed)
     return torch.randn(vocab, hidden, generator=gen, dtype=dtype)
 
@@ -72,6 +97,7 @@ def _rand_weight(vocab=_VOCAB, hidden=_HIDDEN, *, seed, dtype=torch.float32):
 # bitwise. The fp32 dtype path (forward) is identical to the ground truth, so
 # it too is bitwise equal -- only bf16/fp16 introduce drift.
 def test_native_lm_head_fp32_matches_naive_matmul():
+    """forward_fp32 (and the fp32 forward path) is bitwise-equal to a naive fp32 matmul."""
     hidden = _rand_hidden(2, 5, seed=1)
     weight = _rand_weight(seed=1)
 
@@ -83,8 +109,9 @@ def test_native_lm_head_fp32_matches_naive_matmul():
 
 # Axis-B accuracy: the low-precision dtype path drifts from the fp32 reference
 # by a bounded fraction of the output peak. Errors/stats are printed for the PR.
-@pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float16))
+@pytest.mark.parametrize("dtype", _DTYPES_AXIS_B)
 def test_native_lm_head_dtype_path_accuracy(dtype: torch.dtype):
+    """Axis-B: the low-precision path drifts from fp32 by a bounded fraction of the output peak."""
     op = NativeLMHeadOp()
     hidden = _rand_hidden(2, 16, seed=2)
     weight = _rand_weight(seed=2)
@@ -102,6 +129,7 @@ def test_native_lm_head_dtype_path_accuracy(dtype: torch.dtype):
 
 # Output shape must be hidden.shape[:-1] + (vocab,).
 def test_native_lm_head_output_shape():
+    """Output shape is hidden.shape[:-1] + (vocab,)."""
     hidden = _rand_hidden(3, 7, seed=3)
     weight = _rand_weight(seed=3)
     out = NativeLMHeadOp().forward(hidden, weight)
@@ -110,6 +138,7 @@ def test_native_lm_head_output_shape():
 
 # Bias: None (Qwen3 default) is a plain matmul; a provided [vocab] bias is added.
 def test_native_lm_head_bias():
+    """bias=None is a plain matmul; a [vocab] bias is added elementwise."""
     op = NativeLMHeadOp()
     hidden = _rand_hidden(2, 4, seed=4)
     weight = _rand_weight(seed=4)
@@ -127,8 +156,9 @@ def test_native_lm_head_bias():
 # logits must not depend on how many other rows share the batch. Compute on the
 # full input once, then slice -- never compute a slice on its own. Requires the
 # pinned single-thread reduction order (see module docstring).
-@pytest.mark.parametrize("dtype", (torch.float32, torch.bfloat16, torch.float16))
+@pytest.mark.parametrize("dtype", _DTYPES_AXIS_A)
 def test_lm_head_batch_invariance_slice(dtype: torch.dtype):
+    """Axis-A: a row's logits are bitwise-independent of how many rows share the batch."""
     op = NativeLMHeadOp()
     hidden = _rand_hidden(8, 32, seed=5).to(dtype)
     weight = _rand_weight(seed=5).to(dtype)
@@ -138,7 +168,7 @@ def test_lm_head_batch_invariance_slice(dtype: torch.dtype):
         assert torch.equal(op.forward(hidden[3:5], weight), full[3:5])
 
 
-@pytest.mark.parametrize("dtype", (torch.float32, torch.bfloat16, torch.float16))
+@pytest.mark.parametrize("dtype", _DTYPES_AXIS_A)
 def test_lm_head_batch_invariance_with_padding(dtype: torch.dtype):
     """Padding extra seq positions must not perturb the real ones (bitwise)."""
     op = NativeLMHeadOp()
@@ -152,6 +182,7 @@ def test_lm_head_batch_invariance_with_padding(dtype: torch.dtype):
 
 # Purity -- no input may be mutated in place.
 def test_lm_head_inputs_not_mutated():
+    """Purity: no input tensor is mutated in place."""
     op = NativeLMHeadOp()
     hidden = _rand_hidden(2, 8, seed=7)
     weight = _rand_weight(seed=7)
@@ -167,6 +198,7 @@ def test_lm_head_inputs_not_mutated():
 # have closed forms: dL/dhidden = weight.sum(0) per row; dL/dweight = sum of
 # hidden over (batch, seq) per vocab row.
 def test_lm_head_gradient_flows():
+    """fp32 autograd matches the closed-form grads of out.sum()."""
     op = NativeLMHeadOp()
     hidden = _rand_hidden(2, 4, seed=8).requires_grad_(True)
     weight = _rand_weight(seed=8).requires_grad_(True)
@@ -182,6 +214,7 @@ def test_lm_head_gradient_flows():
 
 # Registry dispatch -- "lm_head" resolves to NativeLMHeadOp.
 def test_registry_dispatches_native_lm_head_op():
+    """The registry resolves "lm_head" to NativeLMHeadOp."""
     assert isinstance(kernel_registry.get_op("lm_head"), NativeLMHeadOp)
 
 
@@ -194,9 +227,13 @@ def test_registry_dispatches_native_lm_head_op():
 # the logic; this validates the real vocab width and hidden reduction length at
 # a small (batch, seq) load point.
 def _enough_gpu_memory(num_bytes: int) -> bool:
+    """Return True only if CUDA is present and has free memory with headroom."""
     if not torch.cuda.is_available():
         return False
-    free, _ = torch.cuda.mem_get_info()
+    try:
+        free, _ = torch.cuda.mem_get_info()
+    except RuntimeError:
+        return False
     return free > int(num_bytes * 1.5)  # headroom for the logits output
 
 
@@ -205,6 +242,7 @@ def _enough_gpu_memory(num_bytes: int) -> bool:
     reason="needs a CUDA GPU with room for the ~2.5 GB fp32 Qwen3-8B lm_head weight",
 )
 def test_native_lm_head_qwen3_8b_real_shape():
+    """GPU smoke test at real Qwen3-8B dims (vocab=151936, hidden=4096)."""
     device = torch.device("cuda")
     op = NativeLMHeadOp()
 

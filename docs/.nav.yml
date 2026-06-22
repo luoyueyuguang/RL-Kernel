@@ -12,9 +12,9 @@ nav:
       - operators/README.md
       - operators/fused-logp.md
       - operators/grpo-loss.md
+      - operators/lm_head.md
       - operators/ratio-kl.md
       - operators/sampling.md
-      - operators/lm_head.md
   - Developer Guide:
     - contributing/README.md
     - General:
