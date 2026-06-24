@@ -3,12 +3,16 @@
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Any, Optional
 
 import torch
 
 from rl_engine.kernels.ops.base import _C, _EXT_AVAILABLE
-from rl_engine.kernels.ops.pytorch.loss.linear_logp import chunked_linear_logp_backward
+from rl_engine.kernels.ops.pytorch.loss.linear_logp import (
+    chunked_linear_logp_backward,
+    should_use_tensor_parallel_linear_logp,
+    tensor_parallel_linear_logp,
+)
 from rl_engine.utils.logger import logger
 
 # Hidden-dim slice the SM90 forward streams per TMA load; D must be a multiple of
@@ -18,8 +22,13 @@ _SM90_BK = 32
 
 def _sm90_supported(hidden: torch.Tensor, lm_head_weight: torch.Tensor) -> bool:
     """Whether the bf16 TMA+MMA forward can run these inputs directly."""
+    if not (hidden.is_cuda and lm_head_weight.is_cuda):
+        return False
+    if hidden.device != lm_head_weight.device:
+        return False
+    cc_major, _ = torch.cuda.get_device_capability(hidden.device)
     return (
-        hidden.is_cuda
+        cc_major == 9
         and hidden.dtype == torch.bfloat16
         and lm_head_weight.dtype == torch.bfloat16
         and hidden.size(-1) % _SM90_BK == 0
@@ -105,8 +114,20 @@ class FusedLinearLogpSM90Op:
         lm_head_weight: torch.Tensor,
         target_ids: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
+        *,
+        tp_group: Any = None,
+        vocab_start_index: int = 0,
+        global_vocab_size: Optional[int] = None,
     ) -> torch.Tensor:
-        return self.apply(hidden, lm_head_weight, target_ids, bias)
+        return self.apply(
+            hidden,
+            lm_head_weight,
+            target_ids,
+            bias,
+            tp_group=tp_group,
+            vocab_start_index=vocab_start_index,
+            global_vocab_size=global_vocab_size,
+        )
 
     def apply(
         self,
@@ -114,6 +135,10 @@ class FusedLinearLogpSM90Op:
         lm_head_weight: torch.Tensor,
         target_ids: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
+        *,
+        tp_group: Any = None,
+        vocab_start_index: int = 0,
+        global_vocab_size: Optional[int] = None,
     ) -> torch.Tensor:
         if lm_head_weight.size(-1) != hidden.size(-1):
             raise ValueError(
@@ -140,6 +165,21 @@ class FusedLinearLogpSM90Op:
                 raise ValueError(
                     f"bias device {bias.device} must match hidden device {hidden.device}"
                 )
+        if should_use_tensor_parallel_linear_logp(
+            tp_group,
+            int(vocab_start_index),
+            global_vocab_size,
+            lm_head_weight.size(0),
+        ):
+            return tensor_parallel_linear_logp(
+                hidden,
+                lm_head_weight,
+                target_ids,
+                bias,
+                tp_group=tp_group,
+                vocab_start_index=vocab_start_index,
+                global_vocab_size=global_vocab_size,
+            )
         if not _sm90_supported(hidden, lm_head_weight):
             return _fallback_op()(hidden, lm_head_weight, target_ids, bias)
         vocab = lm_head_weight.size(0)

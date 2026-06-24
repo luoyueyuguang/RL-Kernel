@@ -1,8 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 RL-Kernel Contributors
 
+import queue
+import socket
+import traceback
+
 import pytest
 import torch
+import torch.multiprocessing as mp
 
 from rl_engine.kernels.ops.pytorch.loss.linear_logp import NativeLinearLogpOp
 
@@ -38,6 +43,88 @@ requires_sm90 = pytest.mark.skipif(
     reason="Fused linear log-prob SM90 kernel requires a Hopper (sm_90) GPU with the "
     "extension built KERNEL_ALIGN_FORCE_SM90=1.",
 )
+
+
+def _gloo_available():
+    return torch.distributed.is_available() and torch.distributed.is_gloo_available()
+
+
+requires_gloo = pytest.mark.skipif(
+    not _gloo_available(),
+    reason="tensor-parallel linear_logp CPU test requires torch.distributed Gloo.",
+)
+
+
+def _find_free_tcp_port():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def _tp_linear_logp_gloo_worker(rank, world_size, init_method, result_queue):
+    try:
+        import torch.distributed as dist
+
+        torch.set_num_threads(1)
+        dist.init_process_group(
+            backend="gloo",
+            init_method=init_method,
+            rank=rank,
+            world_size=world_size,
+        )
+
+        torch.manual_seed(2026)
+        n, d, vocab = 8, 5, 16
+        boundaries = [0, 3, 7, 12, vocab]
+        start = boundaries[rank]
+        end = boundaries[rank + 1]
+
+        hidden_base = torch.randn(n, d)
+        weight_full = torch.randn(vocab, d)
+        bias_full = torch.randn(vocab)
+        target = torch.tensor([0, 2, 3, 6, 7, 11, 12, 15], dtype=torch.long)
+        grad_out = torch.randn(n)
+        op = NativeLinearLogpOp()
+
+        ref_hidden = hidden_base.detach().clone().requires_grad_(True)
+        ref_weight = weight_full.detach().clone().requires_grad_(True)
+        ref_bias = bias_full.detach().clone().requires_grad_(True)
+        ref_out = op(ref_hidden, ref_weight, target, ref_bias)
+        ref_out.backward(grad_out)
+
+        tp_hidden = hidden_base.detach().clone().requires_grad_(True)
+        local_weight = weight_full[start:end].detach().clone().requires_grad_(True)
+        local_bias = bias_full[start:end].detach().clone().requires_grad_(True)
+        tp_out = op(
+            tp_hidden,
+            local_weight,
+            target,
+            local_bias,
+            tp_group=dist.group.WORLD,
+            vocab_start_index=start,
+            global_vocab_size=vocab,
+        )
+        tp_out.backward(grad_out)
+
+        result_queue.put(
+            {
+                "ok": True,
+                "rank": rank,
+                "out": float((tp_out - ref_out).abs().max().item()),
+                "hidden_grad": float((tp_hidden.grad - ref_hidden.grad).abs().max().item()),
+                "weight_grad": float(
+                    (local_weight.grad - ref_weight.grad[start:end]).abs().max().item()
+                ),
+                "bias_grad": float((local_bias.grad - ref_bias.grad[start:end]).abs().max().item()),
+            }
+        )
+    except Exception:  # pragma: no cover - forwarded to parent process
+        result_queue.put({"ok": False, "rank": rank, "traceback": traceback.format_exc()})
+        raise
+    finally:
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.destroy_process_group()
+
 
 # SM90 forward needs bf16 and a hidden dim that is a multiple of the kernel's K
 # slice (32); N / V are deliberately left unaligned to the 64-wide tiles.
@@ -97,6 +184,57 @@ def test_native_rejects_shape_mismatch():
     hidden, weight, _, bias = _inputs(0, device="cpu")
     with pytest.raises(ValueError):
         native(hidden, weight, torch.zeros(_N + 1, dtype=torch.long), bias)
+
+
+def test_tensor_parallel_metadata_requires_multi_rank_group():
+    native = NativeLinearLogpOp()
+    hidden, weight, target, bias = _inputs(0, device="cpu")
+    with pytest.raises(ValueError, match="vocab_start_index requires"):
+        native(hidden, weight, target, bias, vocab_start_index=4)
+    with pytest.raises(ValueError, match="global_vocab_size differs"):
+        native(hidden, weight, target, bias, global_vocab_size=weight.size(0) + 1)
+
+
+@requires_gloo
+def test_native_tensor_parallel_matches_full_reference_cpu_gloo_4_ranks():
+    ctx = mp.get_context("spawn")
+    world_size = 4
+    init_method = f"tcp://127.0.0.1:{_find_free_tcp_port()}"
+    result_queue = ctx.Queue()
+    processes = [
+        ctx.Process(
+            target=_tp_linear_logp_gloo_worker,
+            args=(rank, world_size, init_method, result_queue),
+        )
+        for rank in range(world_size)
+    ]
+
+    for process in processes:
+        process.start()
+
+    results = []
+    try:
+        for _ in processes:
+            results.append(result_queue.get(timeout=45))
+    except queue.Empty:
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+        pytest.fail("timed out waiting for tensor-parallel Gloo workers")
+    finally:
+        for process in processes:
+            process.join(timeout=10)
+            if process.is_alive():
+                process.terminate()
+
+    for process in processes:
+        assert process.exitcode == 0
+    for result in sorted(results, key=lambda item: item["rank"]):
+        assert result["ok"], result.get("traceback")
+        assert result["out"] < 1e-5
+        assert result["hidden_grad"] < 1e-5
+        assert result["weight_grad"] < 1e-5
+        assert result["bias_grad"] < 1e-5
 
 
 @requires_triton_cuda
