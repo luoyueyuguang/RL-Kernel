@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from rl_engine.testing.tolerance import load_contract
+from rl_engine.kernels.gtest.tolerance import load_contract
 
 
 def test_load_contract_contains_expected_operator_classes():
