@@ -116,17 +116,40 @@ def test_embedding_inputs_not_mutated():
 # Gradient flows (fp32 autograd = backward golden source). Gradient is only
 # defined for weight (token_ids are integer indices). The weight gradient is
 # sparse: only the rows that were indexed are non-zero; unused rows stay 0.
+#
+# Reproducibility caveat: embedding backward is a scatter-add -- repeated token
+# ids accumulate into the same weight.grad row. On CUDA that uses atomic adds
+# (nondeterministic ordering), so the weight gradient is bit-exact across runs
+# only under torch.use_deterministic_algorithms(True). Since forward_fp32 is the
+# backward golden source, we enable it here and assert the gradient is bitwise
+# reproducible across two independent backward passes. CPU is always deterministic.
 def test_embedding_gradient_flows_to_weight():
     op = NativeEmbeddingOp()
-    token_ids = _rand_ids((2, 4), seed=7, vocab=10)  # small vocab -> some unused rows
-    weight = _rand_weight(vocab=10, seed=7).requires_grad_(True)
-    op.forward_fp32(token_ids, weight).sum().backward()
+    # Small vocab -> some rows unused, and repeated ids -> the scatter-add path
+    # (multiple contributions into one row) is actually exercised.
+    token_ids = _rand_ids((2, 4), seed=7, vocab=10)
 
-    assert torch.isfinite(weight.grad).all()
+    prev = torch.are_deterministic_algorithms_enabled()
+    torch.use_deterministic_algorithms(True)
+    try:
+        weight_a = _rand_weight(vocab=10, seed=7).requires_grad_(True)
+        op.forward_fp32(token_ids, weight_a).sum().backward()
+        grad_a = weight_a.grad
+
+        weight_b = _rand_weight(vocab=10, seed=7).requires_grad_(True)
+        op.forward_fp32(token_ids, weight_b).sum().backward()
+        grad_b = weight_b.grad
+    finally:
+        torch.use_deterministic_algorithms(prev)
+
+    assert torch.isfinite(grad_a).all()
+    # Backward golden source must be bitwise reproducible (Axis-A for gradients).
+    assert torch.equal(grad_a, grad_b)
+    # Sparse gradient: rows never indexed stay exactly zero.
     used = torch.unique(token_ids).tolist()
     unused = torch.tensor([i for i in range(10) if i not in used])
     if len(unused):
-        assert torch.equal(weight.grad[unused], torch.zeros_like(weight.grad[unused]))
+        assert torch.equal(grad_a[unused], torch.zeros_like(grad_a[unused]))
 
 
 # Registry dispatch -- "embedding" resolves to NativeEmbeddingOp (matches the

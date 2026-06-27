@@ -99,3 +99,12 @@ test at the real Qwen3-8B dims (`vocab=151936, hidden=4096`, boundary ids `0` an
 
 - PyTorch fallback only; no fused CUDA/Triton backend yet (downstream work).
 - Out-of-range token ids are not validated; callers must keep ids in `[0, vocab)`.
+- **GPU backward is bitwise-reproducible only under deterministic algorithms.** The
+  forward is a lossless gather (always reproducible), but `∂L/∂weight` is a scatter-add:
+  every repeated token id (padding, common tokens) accumulates into the same `weight.grad`
+  row. On CUDA that accumulation uses atomic adds, whose ordering is nondeterministic, so
+  the weight gradient is not bit-exact across runs when ids collide. PyTorch documents
+  `embedding` backward as a nondeterministic CUDA op for this reason. Since `forward_fp32`
+  is the backward golden source, callers that need a reproducible GPU gradient must enable
+  `torch.use_deterministic_algorithms(True)` (the gradient test does this). CPU backward is
+  always deterministic.
