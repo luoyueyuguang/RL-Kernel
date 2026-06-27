@@ -15,6 +15,4 @@ Useful pages:
 
 - [Documentation Guide](documentation.md)
 - [Testing](testing.md)
-- [PR 189 Test Results](pr-189-test-results.md)
-- [vime + RL-Kernel Linear LogP Experiment](vime-RLK.md)
 - [Runtime Dispatch](../design/runtime-dispatch.md)
