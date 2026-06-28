@@ -69,8 +69,9 @@ The op exposes the WS1 dual-path contract:
 expression is correct for both prefill (`Sq == Skv`) and decode (`Sq < Skv`, one query sees
 the whole cache).
 
-Pure function — no randomness, no in-place mutation; device and original dtype follow the
-inputs. Masks are built on the inputs' device.
+Pure function — no randomness, no in-place mutation; device follows the inputs. `forward(...)`
+preserves the input dtype, while `forward_fp32(...)` always returns fp32. Masks are built on
+the inputs' device.
 
 ## Dispatch Behavior
 
@@ -113,7 +114,7 @@ out = torch.matmul(probs, vf)                # [B, Hq, Sq, D]
   across batch slicing **and chunked** (chunked-prefill) configurations — these keep the softmax
   reduction width fixed. `key_padding_mask` is the exception: padding changes the reduction width
   (e.g. Skv=10 vs 6), so the masked result only matches the valid-only result up to a small
-  tolerance (`atol=1e-6`), not bitwise, in IEEE 754.
+  tolerance (`atol=2e-6`), not bitwise, in IEEE 754.
 - **Axis B — tolerance**: as a `reduction` op, low-precision tolerance follows the `reduction`
   row of the WS1 numerical contract. Measured drift vs the fp32 golden path (rel-peak):
 
