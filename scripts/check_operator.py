@@ -53,8 +53,9 @@ def _summarize(report: Any) -> None:
         )
         for case in candidate.cases:
             for output in case.outputs:
+                label = f" {output.message}" if output.message else ""
                 print(
-                    f"  case={case.case_name} output={output.output_index} "
+                    f"  case={case.case_name} output={output.output_index}{label} "
                     f"shape={output.shape} dtype={output.candidate_dtype} "
                     f"max_abs={output.max_abs_error:.8e} "
                     f"mean_abs={output.mean_abs_error:.8e} "
@@ -91,6 +92,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional tolerance override key, for example sm90. Defaults to contract.default.",
     )
+    parser.add_argument("--check-grad", action="store_true", help="Also compare gradients for supported inputs.")
     parser.add_argument("--json", action="store_true", help="Print the full structured report as JSON.")
     return parser.parse_args()
 
@@ -101,7 +103,12 @@ def main() -> None:
     device = _select_device(args.device)
     candidate = make_candidate(args)
     case = make_operator_case(args, dtype, device)
-    report = run_operator_suite(args.op, candidates=[candidate], cases=[case])
+    report = run_operator_suite(
+        args.op,
+        candidates=[candidate],
+        cases=[case],
+        check_grad=args.check_grad,
+    )
 
     if args.json:
         print(json.dumps(report.to_dict(), indent=2, default=str))

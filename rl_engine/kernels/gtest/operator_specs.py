@@ -21,6 +21,7 @@ class OperatorSpec:
     gold_path: str
     registry_name: str
     candidate_paths: dict[str, str]
+    grad_input_names: tuple[str, ...] = ()
 
 
 def _load_object(path: str) -> Any:
@@ -42,6 +43,7 @@ OP_SPECS = {
             "cuda-generic": "rl_engine.kernels.ops.cuda.loss.logp.FusedLogpGenericOp",
             "cuda-sm90": "rl_engine.kernels.ops.cuda.loss.logp.FusedLogpSM90Op",
         },
+        grad_input_names=("logits",),
     ),
 }
 
@@ -72,6 +74,7 @@ def make_operator_case(
         dtype=dtype,
         inputs=make_operator_inputs(args.op, args, dtype, device),
         gold_fn=gold_op.forward_fp32,
+        grad_input_names=spec.grad_input_names,
     )
 
 

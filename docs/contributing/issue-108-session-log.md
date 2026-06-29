@@ -201,6 +201,7 @@ Supported key options:
 --constant-value  Floating-point value for constant mode.
 --token-value     Token id for constant mode, reduced modulo vocab.
 --seed            Random seed for reproducible random inputs.
+--check-grad      Also compare gradients for inputs declared by the operator spec.
 --json            Print the full structured report as JSON.
 ```
 
@@ -369,6 +370,12 @@ CPU CLI smoke test:
 python scripts/check_operator.py   --op logp   --candidate pytorch   --device cpu   --dtype fp32   --batch 1   --seq 2   --vocab 17
 ```
 
+Backward CLI smoke test:
+
+```bash
+python scripts/check_operator.py   --op logp   --candidate pytorch   --device cpu   --dtype fp32   --batch 1   --seq 2   --vocab 17   --check-grad
+```
+
 ## PR Review Updates
 
 ### LogP Gradient Coverage
@@ -389,3 +396,29 @@ Reasoning:
 - The checker PR already validates forward output values, but review feedback called out that logprob coverage should also prove gradient propagation and batch invariance.
 - The new gradient test compares the op gradient against a direct PyTorch `log_softmax + gather` reference under a non-unit upstream gradient.
 - Batch invariance was already covered by `TestNativeLogpOpBatchInvariance` in `tests/test_logp.py`, so no duplicate batch-invariance test was added.
+
+### GTest Backward Check Support
+
+Files:
+
+```text
+rl_engine/kernels/gtest/op_checks.py
+rl_engine/kernels/gtest/operator_specs.py
+scripts/check_operator.py
+tests/test_op_checks.py
+docs/contributing/issue-108-session-log.md
+```
+
+Change:
+
+- Added `OperatorCase.grad_input_names` to declare which inputs should be checked for gradients.
+- Added `run_operator_suite(..., check_grad=True)`.
+- Added `_run_case_backward()` to compare candidate forward outputs and selected input gradients against the PyTorch gold path.
+- Added `OperatorSpec.grad_input_names`; `logp` declares `("logits",)`.
+- Added `scripts/check_operator.py --check-grad`.
+
+Reasoning:
+
+- Forward-only checks can miss incorrect or disconnected backward paths.
+- Gradient inputs must be declared per operator because not every floating tensor should receive gradients.
+- Input generation remains independent of autograd; the runner clones inputs and enables `requires_grad` only inside the backward check path.

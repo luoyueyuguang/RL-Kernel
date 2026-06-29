@@ -21,6 +21,7 @@ class OperatorCase:
     dtype: torch.dtype
     inputs: Mapping[str, Any]
     gold_fn: Callable[..., Any]
+    grad_input_names: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -95,6 +96,7 @@ def run_operator_suite(
     candidates: Sequence[CandidateSpec],
     cases: Sequence[OperatorCase],
     contract: Mapping[str, Any] | None = None,
+    check_grad: bool = False,
 ) -> OperatorCheckReport:
     """Run candidates against gold outputs and return a structured report."""
 
@@ -104,7 +106,8 @@ def run_operator_suite(
     # camdidate : test instance
     # loaded_contract : tolerance table
     candidate_reports = [
-        _run_candidate(candidate, cases, loaded_contract) for candidate in candidates
+        _run_candidate(candidate, cases, loaded_contract, check_grad=check_grad)
+        for candidate in candidates
     ]
     passed_candidates = sum(1 for report in candidate_reports if report.passed)
     total_candidates = len(candidate_reports)
@@ -123,8 +126,11 @@ def _run_candidate(
     candidate: CandidateSpec,
     cases: Sequence[OperatorCase],
     contract: Mapping[str, Any],
+    *,
+    check_grad: bool,
 ) -> CandidateReport:
-    case_checks = [_run_case(candidate, case, contract) for case in cases]
+    case_runner = _run_case_backward if check_grad else _run_case
+    case_checks = [case_runner(candidate, case, contract) for case in cases]
     total_outputs = sum(len(case.outputs) for case in case_checks)
     passed_outputs = sum(
         1 for case in case_checks for output in case.outputs if output.passed
@@ -146,9 +152,68 @@ def _run_case(
     case: OperatorCase,
     contract: Mapping[str, Any],
 ) -> CaseCheck:
-    # TODO(issue-108): add optional gradient checks for differentiable operators.
     candidate_outputs = _flatten_tensors(_call_candidate(candidate.fn, case.inputs))
     gold_outputs = _flatten_tensors(case.gold_fn(**case.inputs))
+    return _compare_case_outputs(candidate, case, contract, candidate_outputs, gold_outputs)
+
+
+def _run_case_backward(
+    candidate: CandidateSpec,
+    case: OperatorCase,
+    contract: Mapping[str, Any],
+) -> CaseCheck:
+    if not case.grad_input_names:
+        raise ValueError(f"case {case.name!r} does not declare gradient inputs")
+
+    candidate_inputs = _clone_inputs_for_backward(case.inputs, case.grad_input_names)
+    gold_inputs = _clone_inputs_for_backward(case.inputs, case.grad_input_names)
+    candidate_outputs = _flatten_tensors(_call_candidate(candidate.fn, candidate_inputs))
+    gold_outputs = _flatten_tensors(case.gold_fn(**gold_inputs))
+    candidate_grads = _backward_grads(candidate_outputs, candidate_inputs, case.grad_input_names)
+    gold_grads = _backward_grads(gold_outputs, gold_inputs, case.grad_input_names)
+    output_checks = _compare_case_outputs(
+        candidate,
+        case,
+        contract,
+        candidate_outputs,
+        gold_outputs,
+    ).outputs
+    atol, rtol = _resolve_tolerance(
+        contract,
+        op_class=case.op_class,
+        dtype=case.dtype,
+        arch_key=candidate.arch_key,
+    )
+    grad_checks = [
+        _compare_output(
+            candidate_grad,
+            gold_grad,
+            output_index=len(output_checks) + index,
+            atol=atol,
+            rtol=rtol,
+            message=f"gradient:{name}",
+        )
+        for index, (name, candidate_grad, gold_grad) in enumerate(
+            zip(case.grad_input_names, candidate_grads, gold_grads, strict=True)
+        )
+    ]
+    checks = [*output_checks, *grad_checks]
+    return CaseCheck(
+        case_name=case.name,
+        dtype=str(case.dtype),
+        op_class=case.op_class,
+        passed=all(output.passed for output in checks),
+        outputs=checks,
+    )
+
+
+def _compare_case_outputs(
+    candidate: CandidateSpec,
+    case: OperatorCase,
+    contract: Mapping[str, Any],
+    candidate_outputs: list[torch.Tensor],
+    gold_outputs: list[torch.Tensor],
+) -> CaseCheck:
     if len(candidate_outputs) != len(gold_outputs):
         raise ValueError(
             f"candidate {candidate.name!r} returned {len(candidate_outputs)} outputs, "
@@ -186,6 +251,44 @@ def _call_candidate(candidate: Callable[..., Any] | Any, inputs: Mapping[str, An
     if hasattr(candidate, "forward") and callable(candidate.forward):
         return candidate.forward(**inputs)
     return candidate(**inputs)
+
+
+def _clone_inputs_for_backward(
+    inputs: Mapping[str, Any],
+    grad_input_names: tuple[str, ...],
+) -> dict[str, Any]:
+    grad_names = set(grad_input_names)
+    cloned: dict[str, Any] = {}
+    for name, value in inputs.items():
+        if isinstance(value, torch.Tensor):
+            tensor = value.detach().clone()
+            if name in grad_names:
+                if not tensor.is_floating_point():
+                    raise TypeError(f"gradient input {name!r} must be floating point")
+                tensor.requires_grad_(True)
+            cloned[name] = tensor
+        else:
+            cloned[name] = value
+    missing = grad_names.difference(cloned)
+    if missing:
+        raise ValueError(f"missing gradient inputs: {', '.join(sorted(missing))}")
+    return cloned
+
+
+def _backward_grads(
+    outputs: list[torch.Tensor],
+    inputs: Mapping[str, Any],
+    grad_input_names: tuple[str, ...],
+) -> list[torch.Tensor]:
+    loss = sum(output.float().sum() for output in outputs)
+    loss.backward()
+    grads: list[torch.Tensor] = []
+    for name in grad_input_names:
+        grad = inputs[name].grad
+        if grad is None:
+            raise ValueError(f"gradient for input {name!r} is None")
+        grads.append(grad)
+    return grads
 
 
 def _flatten_tensors(value: Any) -> list[torch.Tensor]:
@@ -239,6 +342,7 @@ def _compare_output(
     output_index: int,
     atol: float,
     rtol: float,
+    message: str = "",
 ) -> OutputCheck:
     if candidate.shape != gold.shape:
         return OutputCheck(
@@ -279,6 +383,7 @@ def _compare_output(
         mean_abs_error=mean_abs_error,
         max_rel_error=max_rel_error,
         passed=bool(torch.allclose(candidate_fp32, gold_fp32, atol=atol, rtol=rtol)),
+        message=message,
     )
 
 
