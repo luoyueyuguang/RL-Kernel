@@ -89,6 +89,8 @@ __global__ void fused_linear_logp_sm90_kernel(const __grid_constant__ CUtensorMa
     const uint64_t sW_base_tma = __cvta_generic_to_shared(sW);
     const uint32_t sH_base = static_cast<uint32_t>(sH_base_tma);
     const uint32_t sW_base = static_cast<uint32_t>(sW_base_tma);
+    // mbarrier PTX expects the 64-bit shared address, while ldmatrix below uses
+    // the narrowed 32-bit shared address form.
     uint64_t mbar[STAGES];
 #pragma unroll
     for (int s = 0; s < STAGES; ++s)

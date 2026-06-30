@@ -5,7 +5,7 @@
 
 Launch with torchrun, for example:
 
-    torchrun --standalone --nproc_per_node=4 scripts/test_linear_logp_tp.py
+    torchrun --standalone --nproc_per_node=4 tests/linear_logp_tp.py
 
 The correctness phase compares the tensor-parallel path against a materialized
 full-vocab reference. The optional stress phase skips the full reference and only
