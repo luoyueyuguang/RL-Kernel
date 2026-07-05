@@ -361,6 +361,36 @@ def test_batch_invariance_chunked(dtype: torch.dtype):
         assert torch.equal(torch.cat([c1, c2], dim=0), full)
 
 
+@pytest.mark.parametrize("dtype", _DTYPES_AXIS_A)
+def test_backward_batch_invariance_slice(dtype: torch.dtype):
+    """Axis-A (backward): q/k/v grads are bitwise-independent of batch size."""
+    op = NativeAttentionOp()
+    q_full, k_full, v_full = _qkv(8, 16, 16, seed=10, dtype=dtype)
+
+    q_full.requires_grad_(True)
+    k_full.requires_grad_(True)
+    v_full.requires_grad_(True)
+
+    gen = torch.Generator().manual_seed(10)
+    dy = torch.randn(8, _N_HEADS, 16, _HEAD_DIM, generator=gen, dtype=dtype)
+
+    with _single_thread():
+        out_full = op.forward(q_full, k_full, v_full, causal=True)
+        out_full.backward(dy)
+
+    q_slice = q_full[:1].detach().clone().requires_grad_(True)
+    k_slice = k_full[:1].detach().clone().requires_grad_(True)
+    v_slice = v_full[:1].detach().clone().requires_grad_(True)
+
+    with _single_thread():
+        out_slice = op.forward(q_slice, k_slice, v_slice, causal=True)
+        out_slice.backward(dy[:1])
+
+    assert torch.equal(q_slice.grad, q_full.grad[:1])
+    assert torch.equal(k_slice.grad, k_full.grad[:1])
+    assert torch.equal(v_slice.grad, v_full.grad[:1])
+
+
 # --------------------------------------------------------------------------- #
 # Purity / gradient / registry
 # --------------------------------------------------------------------------- #

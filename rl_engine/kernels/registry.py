@@ -56,6 +56,8 @@ class OpBackend(Enum, metaclass=_KernelEnumMeta):
     TRITON_GENERIC = "rl_engine.kernels.ops.triton.generic.TritonOp"
     PYTORCH_ATTN = "rl_engine.kernels.ops.pytorch.attention.NativeAttentionOp"
     PYTORCH_NATIVE = "rl_engine.kernels.ops.pytorch.loss.logp.NativeLogpOp"
+    PYTORCH_NATIVE_MATMUL = "rl_engine.kernels.ops.pytorch.linear.matmul.NativeMatmulOp"
+    PYTORCH_NATIVE_ROPE = "rl_engine.kernels.ops.pytorch.rotary_embedding.rope.NativeRoPEOp"
     PYTORCH_NATIVE_SILU = "rl_engine.kernels.ops.pytorch.activation.swiglu.NativeSiLUOp"
     PYTORCH_NATIVE_SWIGLU = "rl_engine.kernels.ops.pytorch.activation.swiglu.NativeSwiGLUOp"
 
@@ -117,6 +119,8 @@ class KernelRegistry:
                 "silu": [OpBackend.PYTORCH_NATIVE_SILU],
                 "swiglu": [OpBackend.PYTORCH_NATIVE_SWIGLU],
                 # Default dispatch logic for new operators
+                "matmul": [OpBackend.PYTORCH_NATIVE_MATMUL],
+                "rope": [OpBackend.PYTORCH_NATIVE_ROPE],
             },
             "rocm": {
                 "logp": [OpBackend.ROCM_AITER, OpBackend.TRITON_GENERIC, OpBackend.PYTORCH_NATIVE],
@@ -128,8 +132,10 @@ class KernelRegistry:
                 "attention": [OpBackend.PYTORCH_NATIVE_ATTENTION],
                 "kv_cache_attention": [OpBackend.PYTORCH_NATIVE_KV_CACHE_ATTN],
                 "grpo_loss": [OpBackend.TRITON_GRPO_LOSS, OpBackend.PYTORCH_GRPO_LOSS],
+                "rope": [OpBackend.PYTORCH_NATIVE_ROPE],
                 "linear_logp": [OpBackend.TRITON_LINEAR_LOGP, OpBackend.PYTORCH_LINEAR_LOGP],
                 "ratio_kl": [OpBackend.TRITON_RATIO_KL, OpBackend.PYTORCH_RATIO_KL],
+                "matmul": [OpBackend.PYTORCH_NATIVE_MATMUL],
                 "rms_norm": [OpBackend.PYTORCH_NATIVE_RMS_NORM],
                 "lm_head": [OpBackend.PYTORCH_NATIVE_LM_HEAD],
                 "embedding": [OpBackend.PYTORCH_NATIVE_EMBEDDING],
@@ -142,8 +148,10 @@ class KernelRegistry:
                 "attention": [OpBackend.PYTORCH_NATIVE_ATTENTION],
                 "kv_cache_attention": [OpBackend.PYTORCH_NATIVE_KV_CACHE_ATTN],
                 "grpo_loss": [OpBackend.PYTORCH_GRPO_LOSS],
+                "rope": [OpBackend.PYTORCH_NATIVE_ROPE],
                 "linear_logp": [OpBackend.PYTORCH_LINEAR_LOGP],
                 "ratio_kl": [OpBackend.PYTORCH_RATIO_KL],
+                "matmul": [OpBackend.PYTORCH_NATIVE_MATMUL],
                 "rms_norm": [OpBackend.PYTORCH_NATIVE_RMS_NORM],
                 "lm_head": [OpBackend.PYTORCH_NATIVE_LM_HEAD],
                 "embedding": [OpBackend.PYTORCH_NATIVE_EMBEDDING],
@@ -176,8 +184,7 @@ class KernelRegistry:
             )
 
     def _adjust_priority_for_hardware(self):
-        """Prioritize the fused TMA LogP kernel only when it is compiled into the
-        extension and the device is TMA-capable (SM90/100/120)."""
+        """Adjust CUDA priorities for hardware-gated experimental and production kernels."""
         if device_ctx.device_type != "cuda":
             return
         try:
@@ -189,10 +196,11 @@ class KernelRegistry:
             cc = cc_major * 10 + cc_minor
             tma_compiled = _EXT_AVAILABLE and hasattr(_C, "fused_logp_sm90")
 
-            if tma_compiled and cc_major in (9, 10, 12):
+            sm90_logp_enabled = os.getenv("RL_KERNEL_ENABLE_EXPERIMENTAL_SM90_LOGP") == "1"
+            if sm90_logp_enabled and tma_compiled and cc_major in (9, 10, 12):
                 logger.info(
                     f"Detected TMA-capable architecture (SM{cc}); "
-                    "prioritizing fused TMA LogP kernel."
+                    "prioritizing experimental fused TMA LogP kernel."
                 )
                 logp_list = self._priority_map["cuda"]["logp"]
                 if OpBackend.CUDA_FUSED_LOGP_SM90 not in logp_list:
@@ -207,8 +215,8 @@ class KernelRegistry:
                     ll_list.insert(0, OpBackend.CUDA_FUSED_LINEAR_LOGP_SM90)
             elif cc >= 90:
                 logger.debug(
-                    f"SM{cc}: fused TMA LogP kernel not compiled into _C; "
-                    "using generic fused kernel."
+                    f"SM{cc}: fused linear-logp SM90 kernel not compiled into _C; "
+                    "using generic linear-logp backend."
                 )
         except Exception as e:
             logger.warning(f"Failed to probe device capability: {e}")
