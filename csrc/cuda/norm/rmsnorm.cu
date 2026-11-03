@@ -77,6 +77,11 @@ constexpr int RMSNORM_DW_H_TILE = 128;
 
 #if !defined(USE_ROCM)
 constexpr int FP32_LEFT_FOLD_THREADS = 256;
+// Rows staged per thread. The additions stay a strict ascending-row left fold;
+// only the loads are pipelined. A dependent load-add chain issues one request
+// per warp per row and measured 0.6 GB/s on a 114k-row tensor; staging rows in
+// registers lets the loads overlap without touching the add order or the bytes.
+constexpr int FP32_LEFT_FOLD_PREFETCH = 128;
 
 __global__ void reduce_rows_fp32_left_fold_kernel(
     const float* __restrict__ rows,
@@ -90,8 +95,26 @@ __global__ void reduce_rows_fp32_left_fold_kernel(
     }
 
     float acc = 0.0f;
-#pragma unroll 1
-    for (int64_t row = 0; row < row_count; ++row) {
+    int64_t row = 0;
+    constexpr int kPrefetch = FP32_LEFT_FOLD_PREFETCH;
+    if (row_count >= 2 * kPrefetch) {
+        float stage[kPrefetch];
+#pragma unroll
+        for (int i = 0; i < kPrefetch; ++i) {
+            stage[i] = rows[i * columns + column];
+        }
+        for (; row + 2 * kPrefetch <= row_count; row += kPrefetch) {
+#pragma unroll
+            for (int i = 0; i < kPrefetch; ++i) {
+                const float value = stage[i];
+                stage[i] = rows[(row + i + kPrefetch) * columns + column];
+                acc = __fadd_rn(acc, value);
+            }
+        }
+    }
+    // At most 2 * kPrefetch - 1 rows are left; re-reading them keeps the add
+    // order identical and costs one extra pass over a handful of rows.
+    for (; row < row_count; ++row) {
         acc = __fadd_rn(acc, rows[row * columns + column]);
     }
     output[column] = acc;
