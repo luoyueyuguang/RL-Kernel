@@ -285,6 +285,40 @@ void rmsnorm_backward_reduce_dw_cuda(
 
 int64_t rmsnorm_backward_dw_chunks_cuda(int64_t rows);
 
+// Routed per-head Q/K RMSNorm + NeoX RoPE (BAGEL MoT), one source for CUDA and
+// ROCm: plain CUDA C, IEEE FP32, the declared mid-split tree.
+
+std::vector<torch::Tensor> mot_qk_norm_rope_forward(
+  torch::Tensor q,
+  torch::Tensor k,
+  torch::Tensor q_weight_und,
+  torch::Tensor q_weight_gen,
+  torch::Tensor k_weight_und,
+  torch::Tensor k_weight_gen,
+  torch::Tensor gen_mask,
+  torch::Tensor positions,
+  torch::Tensor cos,
+  torch::Tensor sin,
+  double q_eps,
+  double k_eps,
+  bool need_rstd);
+
+std::vector<torch::Tensor> mot_qk_norm_rope_backward(
+  torch::Tensor grad_q,
+  torch::Tensor grad_k,
+  torch::Tensor q,
+  torch::Tensor k,
+  torch::Tensor q_weight_und,
+  torch::Tensor q_weight_gen,
+  torch::Tensor k_weight_und,
+  torch::Tensor k_weight_gen,
+  torch::Tensor gen_mask,
+  torch::Tensor positions,
+  torch::Tensor cos,
+  torch::Tensor sin,
+  torch::Tensor q_rstd,
+  torch::Tensor k_rstd);
+
 #if !defined(USE_ROCM)
 void reduce_rows_fp32_left_fold_cuda(
   torch::Tensor rows,
@@ -721,6 +755,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("rmsnorm_forward", &rmsnorm_forward, "Batch-invariant RMSNorm forward CUDA");
     m.def("rmsnorm_backward_dx", &rmsnorm_backward_dx, "Batch-invariant RMSNorm backward dx CUDA");
     m.def("rmsnorm_backward_dw", &rmsnorm_backward_dw, "Deterministic RMSNorm backward dweight CUDA");
+    // registry Routed Q/K RMSNorm + RoPE (BAGEL MoT)
+    m.def(
+        "mot_qk_norm_rope_forward",
+        &mot_qk_norm_rope_forward,
+        "Routed per-head Q/K RMSNorm + NeoX RoPE forward (two-expert weights)");
+    m.def(
+        "mot_qk_norm_rope_backward",
+        &mot_qk_norm_rope_backward,
+        "Routed per-head Q/K RMSNorm + NeoX RoPE backward (dq, dk, FP32 dW rows)");
 #if !defined(USE_ROCM)
     m.def(
         "reduce_rows_fp32_left_fold",

@@ -225,6 +225,7 @@ def get_extensions():
             "csrc/cuda/logprob/deterministic_logp_kernel.cu",
             "csrc/cuda/gemm/det_gemm_kernel.cu",
             "csrc/cuda/norm/rmsnorm.cu",
+            "csrc/cuda/rope/mot_qk_norm_rope.cu",
             "csrc/cuda/activation/activation.cu",
             "csrc/cuda/attention/deterministic_attention.cu",
         ]

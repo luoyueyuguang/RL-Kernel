@@ -46,6 +46,27 @@ OP_SPECS = {
         },
         grad_input_names=("x", "weight"),
     ),
+    "mot_qk_norm_rope": OperatorSpec(
+        name="mot_qk_norm_rope",
+        op_class="reduction",
+        gold_path="rl_engine.reference.rope.mot_qk_norm_rope.NativeMotQkNormRopeOp",
+        gold_method="forward_fp32",
+        candidate_paths={
+            "pytorch": "rl_engine.reference.rope.mot_qk_norm_rope.NativeMotQkNormRopeOp",
+            "cuda": "rl_engine.backends.cuda.rope.mot_qk_norm_rope.MotQkNormRopeCudaOp",
+            "triton": (
+                "rl_engine.backends.shared.triton.rope.mot_qk_norm_rope.MotQkNormRopeTritonOp"
+            ),
+        },
+        grad_input_names=(
+            "q",
+            "k",
+            "q_weight_und",
+            "q_weight_gen",
+            "k_weight_und",
+            "k_weight_gen",
+        ),
+    ),
     "qk_norm": OperatorSpec(
         name="qk_norm",
         op_class="reduction",
