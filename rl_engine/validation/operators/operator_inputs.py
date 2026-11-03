@@ -8,6 +8,8 @@ from typing import Any
 
 import torch
 
+from rl_engine.reference.rope.mot_qk_norm_rope import build_rope_table
+
 DEFAULT_HIDDEN = 4096
 DEFAULT_N_HEADS = 32
 DEFAULT_N_KV_HEADS = 8
@@ -41,6 +43,7 @@ def make_operator_inputs(
         "swiglu": _make_swiglu_inputs,
         "embedding": _make_embedding_inputs,
         "lm_head": _make_lm_head_inputs,
+        "mot_qk_norm_rope": _make_mot_qk_norm_rope_inputs,
         "kv_cache_attention": _make_kv_cache_attention_inputs,
     }
     try:
@@ -58,6 +61,10 @@ def operator_shape_name(op_name: str, args: argparse.Namespace) -> str:
         f"{_arg_int(args, 'head_dim', DEFAULT_HEAD_DIM)}",
         "pack": f"{batch}x{seq}x{_normalized_dim(args)}",
         "matmul": f"{batch}x{seq}x{_matmul_k(args)}x{_matmul_n(args)}",
+        "mot_qk_norm_rope": f"{batch}x{seq}x"
+        f"{_arg_int(args, 'n_heads', DEFAULT_N_HEADS)}x"
+        f"{_arg_int(args, 'n_kv_heads', DEFAULT_N_KV_HEADS)}x"
+        f"{_arg_int(args, 'head_dim', DEFAULT_HEAD_DIM)}",
         "det_gemm": f"{batch}x{seq}x{_matmul_k(args)}x{_matmul_n(args)}",
         "attention": f"{batch}x{DEFAULT_N_HEADS}x{seq}x{DEFAULT_HEAD_DIM}",
         "prefix_shared_attention": f"{batch}x{_arg_int(args, 'n_heads', DEFAULT_N_HEADS)}"
@@ -144,6 +151,37 @@ def _make_det_gemm_inputs(
     return {
         "a": _floating_tensor((m_dim, k_dim), args, dtype, device, offset=0),
         "b": _floating_tensor((k_dim, n_dim), args, dtype, device, offset=1),
+    }
+
+
+def _make_mot_qk_norm_rope_inputs(
+    args: argparse.Namespace, dtype: torch.dtype, device: torch.device
+) -> dict[str, Any]:
+    """Routed per-head Q/K norm + RoPE: [N, Hq|Hk, 128] rows, one mask per row."""
+
+    batch, seq = _batch_seq(args)
+    n_heads = _arg_int(args, "n_heads", DEFAULT_N_HEADS)
+    n_kv_heads = _arg_int(args, "n_kv_heads", DEFAULT_N_KV_HEADS)
+    head_dim = _arg_int(args, "head_dim", DEFAULT_HEAD_DIM)
+    rows = batch * seq
+    # Alternating rows exercise both expert weights in one call: the row's whole
+    # point is a token stream that mixes the understanding and generator experts.
+    gen_mask = torch.arange(rows, device=device) % 2 == 1
+    positions = torch.arange(rows, device=device, dtype=torch.long)
+    cos, sin = build_rope_table(rows, head_dim, device=device)
+    return {
+        "q": _floating_tensor((rows, n_heads, head_dim), args, dtype, device, offset=0),
+        "k": _floating_tensor((rows, n_kv_heads, head_dim), args, dtype, device, offset=1),
+        "q_weight_und": _floating_tensor((head_dim,), args, dtype, device, offset=2),
+        "q_weight_gen": _floating_tensor((head_dim,), args, dtype, device, offset=3),
+        "k_weight_und": _floating_tensor((head_dim,), args, dtype, device, offset=4),
+        "k_weight_gen": _floating_tensor((head_dim,), args, dtype, device, offset=5),
+        "gen_mask": gen_mask,
+        "positions": positions,
+        "cos": cos,
+        "sin": sin,
+        "q_eps": _arg_float(args, "eps", DEFAULT_RMS_EPS),
+        "k_eps": _arg_float(args, "eps", DEFAULT_RMS_EPS),
     }
 
 

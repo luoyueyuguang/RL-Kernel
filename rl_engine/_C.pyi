@@ -284,6 +284,37 @@ def rmsnorm_backward_dw(
     rstd: torch.Tensor,
     mask: torch.Tensor,
 ) -> torch.Tensor: ...
+def mot_qk_norm_rope_forward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_weight_und: torch.Tensor,
+    q_weight_gen: torch.Tensor,
+    k_weight_und: torch.Tensor,
+    k_weight_gen: torch.Tensor,
+    gen_mask: torch.Tensor,
+    positions: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    q_eps: float,
+    k_eps: float,
+    need_rstd: bool,
+) -> list[torch.Tensor]: ...
+def mot_qk_norm_rope_backward(
+    grad_q: torch.Tensor,
+    grad_k: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_weight_und: torch.Tensor,
+    q_weight_gen: torch.Tensor,
+    k_weight_und: torch.Tensor,
+    k_weight_gen: torch.Tensor,
+    gen_mask: torch.Tensor,
+    positions: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    q_rstd: torch.Tensor,
+    k_rstd: torch.Tensor,
+) -> list[torch.Tensor]: ...
 def deterministic_collective_rocm_ipc_allocate(size_bytes: int) -> torch.Tensor: ...
 def deterministic_collective_rocm_ipc_meta(tensor: torch.Tensor) -> tuple[list[int], int]: ...
 def deterministic_collective_rocm_ipc_create(

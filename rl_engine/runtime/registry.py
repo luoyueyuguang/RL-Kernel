@@ -200,6 +200,12 @@ class OpBackend(Enum, metaclass=_KernelEnumMeta):
     PYTORCH_NATIVE_EMBEDDING = "rl_engine.kernels.ops.pytorch.linear.embedding.NativeEmbeddingOp"
     CUDA_SM90_LM_HEAD = "rl_engine.kernels.ops.cuda.linear.lm_head.SM90LMHeadOp"
     CUDA_SM90_EMBEDDING = "rl_engine.kernels.ops.cuda.linear.embedding.SM90EmbeddingOp"
+    # BAGEL MoT routed per-head Q/K RMSNorm + NeoX RoPE (WS1 single-card row)
+    MOT_QK_NORM_ROPE_CUDA = "rl_engine.backends.cuda.rope.mot_qk_norm_rope.MotQkNormRopeCudaOp"
+    MOT_QK_NORM_ROPE_TRITON = (
+        "rl_engine.backends.shared.triton.rope.mot_qk_norm_rope.MotQkNormRopeTritonOp"
+    )
+    PYTORCH_MOT_QK_NORM_ROPE = "rl_engine.reference.rope.mot_qk_norm_rope.NativeMotQkNormRopeOp"
 
 
 def _default_semantic_descriptors() -> tuple[OperatorBackendDescriptor, ...]:
@@ -586,6 +592,15 @@ class KernelRegistry:
                 "ratio_kl": [OpBackend.TRITON_RATIO_KL, OpBackend.PYTORCH_RATIO_KL],
                 "pack": [OpBackend.PYTORCH_PACK],
                 "det_gemm": [OpBackend.CUDA_DET_GEMM, OpBackend.TRITON_DET_GEMM],
+                # BAGEL MoT routed Q/K norm + RoPE. The CUDA candidates come
+                # first on every platform that has them (the .cu is hipified,
+                # so ROCm runs the same arithmetic); Triton is the parity
+                # reference and the fallback when the symbol is absent.
+                "mot_qk_norm_rope": [
+                    OpBackend.MOT_QK_NORM_ROPE_CUDA,
+                    OpBackend.MOT_QK_NORM_ROPE_TRITON,
+                    OpBackend.PYTORCH_MOT_QK_NORM_ROPE,
+                ],
                 "batch_invariant_logp": [
                     OpBackend.TRITON_BATCH_INVARIANT_LOGP,
                     OpBackend.PYTORCH_BATCH_INVARIANT_LOGP,
@@ -640,6 +655,11 @@ class KernelRegistry:
                 "ratio_kl": [OpBackend.TRITON_RATIO_KL, OpBackend.PYTORCH_RATIO_KL],
                 "pack": [OpBackend.PYTORCH_PACK],
                 "det_gemm": [OpBackend.TRITON_DET_GEMM],
+                "mot_qk_norm_rope": [
+                    OpBackend.MOT_QK_NORM_ROPE_CUDA,
+                    OpBackend.MOT_QK_NORM_ROPE_TRITON,
+                    OpBackend.PYTORCH_MOT_QK_NORM_ROPE,
+                ],
                 "batch_invariant_logp": [
                     OpBackend.TRITON_BATCH_INVARIANT_LOGP,
                     OpBackend.PYTORCH_BATCH_INVARIANT_LOGP,
@@ -723,6 +743,7 @@ class KernelRegistry:
                 "embedding": [OpBackend.PYTORCH_NATIVE_EMBEDDING],
                 "silu": [OpBackend.PYTORCH_NATIVE_SILU],
                 "swiglu": [OpBackend.PYTORCH_NATIVE_SWIGLU],
+                "mot_qk_norm_rope": [OpBackend.PYTORCH_MOT_QK_NORM_ROPE],
             },
             # Ascend NPU: op types without an entry fall back to their CPU
             # candidates (see the runtime override below), so only

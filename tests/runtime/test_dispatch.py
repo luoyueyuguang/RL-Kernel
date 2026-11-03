@@ -256,6 +256,24 @@ def test_executor_flow():
     logger.info(f"Executor result: {result}")
 
 
+def test_mot_qk_norm_rope_priority_maps():
+    from rl_engine.reference.rope.mot_qk_norm_rope import NativeMotQkNormRopeOp
+
+    registry = KernelRegistry()
+    gpu_order = [
+        OpBackend.MOT_QK_NORM_ROPE_CUDA,
+        OpBackend.MOT_QK_NORM_ROPE_TRITON,
+        OpBackend.PYTORCH_MOT_QK_NORM_ROPE,
+    ]
+
+    assert registry._priority_map["cuda"]["mot_qk_norm_rope"] == gpu_order
+    # The .cu is hipified, so ROCm runs the same arithmetic as the CUDA backend.
+    assert registry._priority_map["rocm"]["mot_qk_norm_rope"] == gpu_order
+    assert registry._priority_map["cpu"]["mot_qk_norm_rope"] == [OpBackend.PYTORCH_MOT_QK_NORM_ROPE]
+    assert "mot_qk_norm_rope" not in registry._priority_map["musa"]
+    assert type(kernel_registry.get_op("mot_qk_norm_rope", device="cpu")) is (NativeMotQkNormRopeOp)
+
+
 if __name__ == "__main__":
     try:
         test_logger_enhancements()

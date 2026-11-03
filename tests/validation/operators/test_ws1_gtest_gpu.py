@@ -49,6 +49,7 @@ def test_all_ws1_single_ops_are_registered():
         "pack",
         "linear_logp",
         "prefix_shared_attention",
+        "mot_qk_norm_rope",
     } <= names
 
 
@@ -61,6 +62,7 @@ def test_all_ws1_single_ops_are_registered():
         ("swiglu", "triton"),
         ("rope", "triton"),
         ("pack", "pytorch"),
+        ("mot_qk_norm_rope", "cuda"),
     ],
 )
 def test_check_operator_runs_ported_ops(op, candidate):
