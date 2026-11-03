@@ -6,9 +6,9 @@
 // One block per (token, head) row of 128 elements: a warp mid-split butterfly
 // plus a four-warp combine produce the mean, rstd is 1 / sqrt(mean + eps), the
 // normalized value is rounded once to the declared dtype, and the rotation runs
-// in FP32 with the FP32 cos/sin table. Plain CUDA C only (no PTX, no TMA) so the
-// same source is compiled by hipcc for ROCm, which is what makes the CUDA and
-// ROCm kernels byte-identical.
+// in that declared dtype with the table cast to it (RFC #435). Plain CUDA C only
+// (no PTX, no TMA) so the same source is compiled by hipcc for ROCm, which is
+// what makes the CUDA and ROCm kernels byte-identical.
 
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -50,6 +50,14 @@ __device__ __forceinline__ float to_f32<at::BFloat16>(const at::BFloat16 value) 
 template <typename scalar_t>
 __device__ __forceinline__ scalar_t from_f32(const float value) {
     return static_cast<scalar_t>(value);
+}
+
+// Round-to-nearest-even to the declared dtype and widen back. Every declared-dtype
+// arithmetic step goes through this pair, so "compute in the declared dtype" means
+// the same thing in the reference, the CUDA kernel and the Triton kernel.
+template <typename scalar_t>
+__device__ __forceinline__ float rne_declared(const float value) {
+    return to_f32<scalar_t>(from_f32<scalar_t>(value));
 }
 
 template <>
@@ -135,10 +143,17 @@ __global__ void mot_qk_norm_rope_fwd_kernel(
         const float y_hi = to_f32<scalar_t>(from_f32<scalar_t>(normed_hi));
 
         const int64_t position = positions[token];
-        const float cosine = cos_tab[position * MOT_QK_NORM_HALF + tid];
-        const float sine = sin_tab[position * MOT_QK_NORM_HALF + tid];
-        const float out_lo = __fsub_rn(__fmul_rn(y_lo, cosine), __fmul_rn(y_hi, sine));
-        const float out_hi = __fadd_rn(__fmul_rn(y_hi, cosine), __fmul_rn(y_lo, sine));
+        // RoPE in the declared dtype (RFC #435: "RoPE and Q/K in BF16"). The
+        // engine's rotary table is cast to the query dtype, then each product and
+        // the sum round once — the sequence ``apply_rotary_pos_emb`` evaluates.
+        const float cosine = rne_declared<scalar_t>(cos_tab[position * MOT_QK_NORM_HALF + tid]);
+        const float sine = rne_declared<scalar_t>(sin_tab[position * MOT_QK_NORM_HALF + tid]);
+        const float lo_c = rne_declared<scalar_t>(__fmul_rn(y_lo, cosine));
+        const float hi_s = rne_declared<scalar_t>(__fmul_rn(y_hi, sine));
+        const float hi_c = rne_declared<scalar_t>(__fmul_rn(y_hi, cosine));
+        const float lo_s = rne_declared<scalar_t>(__fmul_rn(y_lo, sine));
+        const float out_lo = rne_declared<scalar_t>(__fsub_rn(lo_c, hi_s));
+        const float out_hi = rne_declared<scalar_t>(__fadd_rn(hi_c, lo_s));
 
         out[base + tid] = from_f32<scalar_t>(out_lo);
         out[base + tid + MOT_QK_NORM_HALF] = from_f32<scalar_t>(out_hi);
@@ -173,6 +188,11 @@ __global__ void mot_qk_norm_rope_bwd_kernel(
     // dnormed_lo = g_lo * c + g_hi * s and dnormed_hi = g_hi * c - g_lo * s.
     const int pair = tid & (MOT_QK_NORM_HALF - 1);
     const int64_t position = positions[token];
+    // The inverse rotation reads the FP32 table: the forward rotates with the
+    // declared-dtype table (RFC #435), but a declared-dtype table in the VJP
+    // accumulates up to 3x the WS1 bf16 gradient cell on dW, so the gradient
+    // keeps the higher-precision table. Deterministic either way; documented in
+    // docs/operators/mot-qk-norm-rope.md.
     const float cosine = cos_tab[position * MOT_QK_NORM_HALF + pair];
     const float sine = sin_tab[position * MOT_QK_NORM_HALF + pair];
     const float g_lo = to_f32<scalar_t>(grad[base + pair]);

@@ -8,14 +8,18 @@ block. Each stream has its own per-head RMSNorm weight for q and for k, and the
 normalized heads are then rotated with NeoX (rotate-half) RoPE:
 
     rstd[t]   = 1 / sqrt(mid_split_mean(x[t]^2) + eps)          # per row = per head
-    normed[t] = ((f32(x[t]) * rstd[t]) * w_e[t])                # w_e = gen ? w_gen : w_und
-    y_lo[t]   = normed[t, :64] * cos - normed[t, 64:] * sin
-    y_hi[t]   = normed[t, 64:] * cos + normed[t, :64] * sin
+    normed[t] = rne_dt((f32(x[t]) * rstd[t]) * w_e[t])          # w_e = gen ? w_gen : w_und
+    c, s      = rne_dt(cos[t]), rne_dt(sin[t])                  # the table in the query dtype
+    y_lo[t]   = rne_dt(rne_dt(normed[t, :64] * c) - rne_dt(normed[t, 64:] * s))
+    y_hi[t]   = rne_dt(rne_dt(normed[t, 64:] * c) + rne_dt(normed[t, :64] * s))
 
-The reduction tree, the multiplication order and the single rounding at the
-declared dtype boundary are the operator's contract (``mot-qk-norm-rope-v1``);
-the CUDA and Triton backends reproduce them op for op, so their outputs are
-byte-identical to each other and to this reference's declared-dtype path.
+The reduction tree, the multiplication order, the single rounding before the
+rotation and the declared-dtype rotation are the operator's contract
+(``mot-qk-norm-rope-v2``, aligned with RFC #435); the CUDA and Triton backends
+reproduce them op for op, so their outputs are byte-identical to each other and to
+this reference's declared-dtype path. ``forward`` carries its own deterministic
+backward: the inverse rotation reads the FP32 table, which is the one documented
+asymmetry against the forward.
 """
 
 from __future__ import annotations
@@ -23,7 +27,7 @@ from __future__ import annotations
 import torch
 from torch import Tensor
 
-MOT_QK_NORM_ROPE_CONTRACT = "mot-qk-norm-rope-v1"
+MOT_QK_NORM_ROPE_CONTRACT = "mot-qk-norm-rope-v2"
 HEAD_DIM = 128
 HALF = 64
 
@@ -87,17 +91,26 @@ def _apply(
     )  # [N, D]
     rstd = _rstd_mid_split(x32, eps)  # [..., 1]: the tree collapses the head dim
     normed = (x32 * rstd) * w.unsqueeze(1)  # w broadcasts over heads
-    if not (fp32 or fp64):
-        # The declared dtype boundary: one RNE to the caller's dtype before the
-        # rotation, exactly as the kernels round their normalized values.
-        normed = normed.to(x.dtype).to(compute_dtype)
+    if fp32 or fp64:
+        lo, hi = normed[..., :HALF], normed[..., HALF:]
+        c = cos[positions].to(compute_dtype).unsqueeze(1)  # [N, 1, HALF]
+        s = sin[positions].to(compute_dtype).unsqueeze(1)
+        return torch.cat([lo * c - hi * s, hi * c + lo * s], dim=-1)
+
+    # Declared-dtype path: the engine's own sequence, so every rounding below is
+    # a place the reference model rounds too. ``Qwen2RotaryEmbedding`` returns a
+    # cos/sin table in the query dtype and ``apply_rotary_pos_emb`` evaluates
+    # ``(q * cos) + (rotate_half(q) * sin)`` in that dtype, so each product and
+    # the sum round once (BAGEL@5019f57, RFC #435 "RoPE and Q/K in BF16").
+    declared = x.dtype
+    normed = normed.to(declared).to(compute_dtype)
     lo, hi = normed[..., :HALF], normed[..., HALF:]
-    c = cos[positions].to(compute_dtype).unsqueeze(1)  # [N, 1, HALF]
-    s = sin[positions].to(compute_dtype).unsqueeze(1)
-    out_lo = lo * c - hi * s
-    out_hi = hi * c + lo * s
-    out = torch.cat([out_lo, out_hi], dim=-1)
-    return out if (fp32 or fp64) else out.to(output_dtype)
+    c = cos[positions].to(declared).to(compute_dtype).unsqueeze(1)
+    s = sin[positions].to(declared).to(compute_dtype).unsqueeze(1)
+    rne = lambda value: value.to(declared).to(compute_dtype)  # noqa: E731
+    out_lo = rne(rne(lo * c) - rne(hi * s))
+    out_hi = rne(rne(hi * c) + rne(lo * s))
+    return torch.cat([out_lo, out_hi], dim=-1).to(output_dtype)
 
 
 def _check_inputs(
@@ -142,6 +155,184 @@ def _check_inputs(
     ):
         if tuple(weight.shape) != (HEAD_DIM,):
             raise ValueError(f"{name} must be [{HEAD_DIM}], got {tuple(weight.shape)}")
+
+
+def _declared_parts(
+    x: Tensor,
+    weight_und: Tensor,
+    weight_gen: Tensor,
+    gen_mask: Tensor,
+    positions: Tensor,
+    cos: Tensor,
+    sin: Tensor,
+    eps: float,
+) -> tuple[Tensor, Tensor]:
+    """Declared-dtype forward of one tensor; returns ``(out, rstd)``.
+
+    The rotation uses the declared-dtype table, which is what the engine's rotary
+    embedding returns (``Qwen2RotaryEmbedding`` casts cos/sin to the query dtype,
+    RFC #435). ``rstd`` is returned so the same row statistic feeds the backward.
+    """
+
+    declared = x.dtype
+    x32 = x.to(torch.float32)
+    w = torch.where(gen_mask[:, None], weight_gen.float(), weight_und.float())
+    rstd = _rstd_mid_split(x32, eps)
+    normed = ((x32 * rstd) * w.unsqueeze(1)).to(declared).to(torch.float32)
+    lo, hi = normed[..., :HALF], normed[..., HALF:]
+    c = cos[positions].to(declared).to(torch.float32).unsqueeze(1)
+    s = sin[positions].to(declared).to(torch.float32).unsqueeze(1)
+    rne = lambda value: value.to(declared).to(torch.float32)  # noqa: E731
+    out = torch.cat([rne(rne(lo * c) - rne(hi * s)), rne(rne(hi * c) + rne(lo * s))], dim=-1)
+    return out.to(declared), rstd
+
+
+def _declared_backward(
+    grad: Tensor,
+    x: Tensor,
+    weight_und: Tensor,
+    weight_gen: Tensor,
+    gen_mask: Tensor,
+    positions: Tensor,
+    cos: Tensor,
+    sin: Tensor,
+    rstd: Tensor,
+) -> tuple[Tensor, Tensor]:
+    """Declared-dtype VJP: returns ``(dx, per-row dW contributions)``.
+
+    The inverse rotation reads the **FP32** table even though the forward rotated
+    with the declared-dtype one: a declared-dtype table in the VJP pushes the
+    accumulated ``dW`` past the WS1 bf16 gradient cell, and that deviation is
+    documented in the operator page. Everything else is the declared sequence.
+    """
+
+    declared = x.dtype
+    x32 = x.to(torch.float32)
+    w = torch.where(gen_mask[:, None], weight_gen.float(), weight_und.float())
+    lo, hi = grad[..., :HALF], grad[..., HALF:]
+    c = cos[positions].to(torch.float32).unsqueeze(1)
+    s = sin[positions].to(torch.float32).unsqueeze(1)
+    rne = lambda value: value.to(declared).to(torch.float32)  # noqa: E731
+    dy = torch.cat([rne(lo * c + hi * s), rne(hi * c - lo * s)], dim=-1)
+    tree = (dy * w.unsqueeze(1)) * x32
+    for _ in range(7):
+        tree = tree.reshape(*tree.shape[:-1], tree.shape[-1] // 2, 2).sum(-1)
+    coeff = (((tree * rstd) * rstd) * rstd) / float(HEAD_DIM)
+    dx = ((rstd * dy) * w.unsqueeze(1)) - x32 * coeff
+    dw_rows = ((dy * x32) * rstd).reshape(-1, HEAD_DIM)
+    return dx.to(declared), dw_rows
+
+
+def _fold_weight_rows(rows: Tensor, mask: Tensor, dtype: torch.dtype) -> Tensor:
+    """Ascending-row left fold of the masked FP32 contributions."""
+
+    masked = rows * mask.to(rows.dtype).unsqueeze(-1)
+    acc = torch.zeros(rows.shape[1], dtype=torch.float32, device=rows.device)
+    for index in range(masked.shape[0]):
+        acc = acc + masked[index]
+    return acc.to(dtype)
+
+
+class _DeclaredMotQkNormRope(torch.autograd.Function):
+    """The declared path with its own deterministic backward.
+
+    Autograd of the forward would rotate the incoming gradient with the
+    declared-dtype table; the kernel does not, so the reference cannot either if
+    the two are to stay comparable.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        q,
+        k,
+        q_weight_und,
+        q_weight_gen,
+        k_weight_und,
+        k_weight_gen,
+        gen_mask,
+        positions,
+        cos,
+        sin,
+        q_eps,
+        k_eps,
+    ):
+        q_out, q_rstd = _declared_parts(
+            q, q_weight_und, q_weight_gen, gen_mask, positions, cos, sin, float(q_eps)
+        )
+        k_out, k_rstd = _declared_parts(
+            k, k_weight_und, k_weight_gen, gen_mask, positions, cos, sin, float(k_eps)
+        )
+        ctx.save_for_backward(
+            q,
+            k,
+            q_weight_und,
+            q_weight_gen,
+            k_weight_und,
+            k_weight_gen,
+            gen_mask,
+            positions,
+            cos,
+            sin,
+            q_rstd,
+            k_rstd,
+        )
+        return q_out, k_out
+
+    @staticmethod
+    def backward(ctx, grad_q, grad_k):
+        (
+            q,
+            k,
+            q_weight_und,
+            q_weight_gen,
+            k_weight_und,
+            k_weight_gen,
+            gen_mask,
+            positions,
+            cos,
+            sin,
+            q_rstd,
+            k_rstd,
+        ) = ctx.saved_tensors
+        dq, q_rows = _declared_backward(
+            grad_q.contiguous(),
+            q,
+            q_weight_und,
+            q_weight_gen,
+            gen_mask,
+            positions,
+            cos,
+            sin,
+            q_rstd,
+        )
+        dk, k_rows = _declared_backward(
+            grad_k.contiguous(),
+            k,
+            k_weight_und,
+            k_weight_gen,
+            gen_mask,
+            positions,
+            cos,
+            sin,
+            k_rstd,
+        )
+        q_expert = gen_mask.repeat_interleave(q.shape[1])
+        k_expert = gen_mask.repeat_interleave(k.shape[1])
+        return (
+            dq,
+            dk,
+            _fold_weight_rows(q_rows, ~q_expert, q_weight_und.dtype),
+            _fold_weight_rows(q_rows, q_expert, q_weight_gen.dtype),
+            _fold_weight_rows(k_rows, ~k_expert, k_weight_und.dtype),
+            _fold_weight_rows(k_rows, k_expert, k_weight_gen.dtype),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
 
 
 class NativeMotQkNormRopeOp:
@@ -203,7 +394,7 @@ class NativeMotQkNormRopeOp:
         q_eps: float = 1e-6,
         k_eps: float = 1e-6,
     ) -> tuple[Tensor, Tensor]:
-        return self._run(
+        _check_inputs(
             q,
             k,
             q_weight_und,
@@ -214,9 +405,20 @@ class NativeMotQkNormRopeOp:
             positions,
             cos,
             sin,
-            q_eps,
-            k_eps,
-            mode="declared",
+        )
+        return _DeclaredMotQkNormRope.apply(
+            q,
+            k,
+            q_weight_und,
+            q_weight_gen,
+            k_weight_und,
+            k_weight_gen,
+            gen_mask,
+            positions,
+            cos,
+            sin,
+            float(q_eps),
+            float(k_eps),
         )
 
     def forward_fp32(

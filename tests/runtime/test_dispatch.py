@@ -260,15 +260,18 @@ def test_mot_qk_norm_rope_priority_maps():
     from rl_engine.reference.rope.mot_qk_norm_rope import NativeMotQkNormRopeOp
 
     registry = KernelRegistry()
-    gpu_order = [
+
+    assert registry._priority_map["cuda"]["mot_qk_norm_rope"] == [
         OpBackend.MOT_QK_NORM_ROPE_CUDA,
         OpBackend.MOT_QK_NORM_ROPE_TRITON,
         OpBackend.PYTORCH_MOT_QK_NORM_ROPE,
     ]
-
-    assert registry._priority_map["cuda"]["mot_qk_norm_rope"] == gpu_order
-    # The .cu is hipified, so ROCm runs the same arithmetic as the CUDA backend.
-    assert registry._priority_map["rocm"]["mot_qk_norm_rope"] == gpu_order
+    # ROCm runs the Triton kernel first: one portable source, JIT per device.
+    assert registry._priority_map["rocm"]["mot_qk_norm_rope"] == [
+        OpBackend.MOT_QK_NORM_ROPE_TRITON,
+        OpBackend.MOT_QK_NORM_ROPE_CUDA,
+        OpBackend.PYTORCH_MOT_QK_NORM_ROPE,
+    ]
     assert registry._priority_map["cpu"]["mot_qk_norm_rope"] == [OpBackend.PYTORCH_MOT_QK_NORM_ROPE]
     assert "mot_qk_norm_rope" not in registry._priority_map["musa"]
     assert type(kernel_registry.get_op("mot_qk_norm_rope", device="cpu")) is (NativeMotQkNormRopeOp)
