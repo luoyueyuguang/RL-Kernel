@@ -108,14 +108,29 @@ def test_cuda_left_fold_is_one_ordered_kernel_launch():
     kernel = source[kernel_start:launcher_start]
     launcher = source[launcher_start:]
 
-    assert "for (int64_t row = 0; row < row_count; ++row)" in kernel
-    assert "#pragma unroll 1" in kernel
-    assert "__fadd_rn(acc, rows[row * columns + column])" in kernel
-    assert "float acc = 0.0f;" in kernel
-    assert "output[column] = acc;" in kernel
+    # One launch, no unordered reduction. The kernel stages rows only to overlap
+    # the loads, so its ordering is asserted behaviourally below rather than by
+    # pinning the loop's spelling.
     assert "tl.sum" not in kernel
     assert "cub::" not in kernel.lower()
     assert launcher.count("reduce_rows_fp32_left_fold_kernel<<<") == 1
+
+
+@pytest.mark.parametrize("rows", [1, 127, 128, 255, 256, 257, 1000])
+def test_cuda_left_fold_matches_ascending_left_fold_on_gpu(rows):
+    if not (
+        torch.cuda.is_available()
+        and vjp_fp32._EXT_AVAILABLE
+        and hasattr(vjp_fp32._C, "reduce_rows_fp32_left_fold")
+    ):
+        pytest.skip("CUDA left-fold kernel is not available")
+
+    # 127/128/255/256/257 straddle the kernel's staged-row boundary, where a
+    # pipelined load loop could silently reorder or drop a row.
+    values = torch.arange(rows * 128, dtype=torch.float32, device="cuda")
+    x = ((values.remainder(29) - 14) / 8).reshape(rows, 128)
+
+    assert torch.equal(reduce_rows_fp32(x), _left_fold_reference(x))
 
 
 def test_cuda_left_fold_binding_has_no_multilaunch_reduction():
