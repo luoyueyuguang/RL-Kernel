@@ -592,10 +592,9 @@ class KernelRegistry:
                 "ratio_kl": [OpBackend.TRITON_RATIO_KL, OpBackend.PYTORCH_RATIO_KL],
                 "pack": [OpBackend.PYTORCH_PACK],
                 "det_gemm": [OpBackend.CUDA_DET_GEMM, OpBackend.TRITON_DET_GEMM],
-                # BAGEL MoT routed Q/K norm + RoPE. The CUDA candidates come
-                # first on every platform that has them (the .cu is hipified,
-                # so ROCm runs the same arithmetic); Triton is the parity
-                # reference and the fallback when the symbol is absent.
+                # BAGEL MoT routed Q/K norm + RoPE. CUDA owns the NVIDIA
+                # ordering; the Triton kernel is the parity reference and the
+                # fallback when the native symbol is absent.
                 "mot_qk_norm_rope": [
                     OpBackend.MOT_QK_NORM_ROPE_CUDA,
                     OpBackend.MOT_QK_NORM_ROPE_TRITON,
@@ -655,9 +654,13 @@ class KernelRegistry:
                 "ratio_kl": [OpBackend.TRITON_RATIO_KL, OpBackend.PYTORCH_RATIO_KL],
                 "pack": [OpBackend.PYTORCH_PACK],
                 "det_gemm": [OpBackend.TRITON_DET_GEMM],
+                # BAGEL MoT routed Q/K norm + RoPE. Triton is the ROCm
+                # implementation: it is JIT-compiled per device from the source
+                # the CUDA parity test pins. The hipified .cu stays as the
+                # fallback when Triton cannot compile for the target.
                 "mot_qk_norm_rope": [
-                    OpBackend.MOT_QK_NORM_ROPE_CUDA,
                     OpBackend.MOT_QK_NORM_ROPE_TRITON,
+                    OpBackend.MOT_QK_NORM_ROPE_CUDA,
                     OpBackend.PYTORCH_MOT_QK_NORM_ROPE,
                 ],
                 "batch_invariant_logp": [

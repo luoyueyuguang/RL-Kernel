@@ -7,8 +7,8 @@ One kernel serves both tensors: a block per ``(token, head)`` row of 128 element
 reduces ``x^2`` over the declared contiguous mid-split tree (a warp butterfly
 with ascending lane offsets 1, 2, 4, 8, 16 plus a four-warp combine), forms
 ``rstd = 1 / sqrt(mean + eps)``, multiplies by the row's expert weight, rounds the
-normalized value once to the declared dtype, and rotates the two halves with the
-FP32 cos/sin table in FP32.
+normalized value once to the declared dtype, and rotates the two halves in that
+declared dtype with the table cast to it (RFC #435).
 
 The `.cu` is plain CUDA C, so ``hipcc`` builds the same source for ROCm and the
 two kernels are byte-identical. The backward is deterministic by construction:

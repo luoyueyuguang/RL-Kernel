@@ -3,16 +3,18 @@
 
 """Triton backend for the BAGEL MoT routed Q/K RMSNorm + NeoX RoPE row.
 
-Same contract as the CUDA source (``mot-qk-norm-rope-v1``), row for row: one
+Same contract as the CUDA source (``mot-qk-norm-rope-v2``), row for row: one
 program per ``(token, head)`` row of 128 elements, the ``x^2`` sum taken over the
 contiguous mid-split tree (seven adjacent-pair levels), ``rstd = 1 / sqrt(mean +
 eps)`` with correctly-rounded division and square root, ``(x * rstd) * w`` with
-the row's expert weight, exactly one rounding to the declared dtype, and the
-rotation in FP32 with the FP32 cos/sin table.
+the row's expert weight, one rounding to the declared dtype, and then the rotation
+in that declared dtype with the table cast to it (RFC #435; ``rne_declared`` after
+each multiply and after the sum).
 
-It is the ROCm candidate for the row (Triton is JIT-compiled per device, so the
-same file serves ROCm and CUDA) and the cross-backend parity reference: on one
-device the Triton and the hipified CUDA kernels are byte-identical.
+It is the ROCm implementation and first dispatch candidate there (Triton is
+JIT-compiled per device, so the same file serves ROCm and CUDA) and the
+cross-backend parity reference: on one device the Triton and the hipified CUDA
+kernels are byte-identical, forward and backward.
 
 ``enable_fp_fusion=False`` keeps the compiler from contracting the rotation into
 FMA, which is what makes the CUDA and Triton outputs comparable bit for bit.
@@ -83,11 +85,19 @@ def _mot_qk_norm_rope_fwd_kernel(
     y_hi = ((hi * rstd) * w_hi).to(OUT.dtype.element_ty).to(tl.float32)
 
     pos = tl.load(POS + token)
-    cosine = tl.load(COS + pos * 64 + d)
-    sine = tl.load(SIN + pos * 64 + d)
     out_ty = OUT.dtype.element_ty
-    tl.store(OUT + base + d, (y_lo * cosine - y_hi * sine).to(out_ty))
-    tl.store(OUT + base + d + 64, (y_hi * cosine + y_lo * sine).to(out_ty))
+    # RoPE in the declared dtype (RFC #435: "RoPE and Q/K in BF16"): the table is
+    # cast to the query dtype, then each product and the sum round once. The
+    # explicit .to(out_ty) after every step is the round-to-nearest-even a
+    # declared-dtype multiply/add performs, and keeps CUDA/Triton bit-identical.
+    cosine = tl.load(COS + pos * 64 + d).to(out_ty).to(tl.float32)
+    sine = tl.load(SIN + pos * 64 + d).to(out_ty).to(tl.float32)
+    lo_c = (y_lo * cosine).to(out_ty).to(tl.float32)
+    hi_s = (y_hi * sine).to(out_ty).to(tl.float32)
+    hi_c = (y_hi * cosine).to(out_ty).to(tl.float32)
+    lo_s = (y_lo * sine).to(out_ty).to(tl.float32)
+    tl.store(OUT + base + d, (lo_c - hi_s).to(out_ty))
+    tl.store(OUT + base + d + 64, (hi_c + lo_s).to(out_ty))
 
 
 @triton.jit
@@ -113,6 +123,10 @@ def _mot_qk_norm_rope_bwd_kernel(
     gen = tl.load(GEN + token).to(tl.int32) != 0
     d = tl.arange(0, 64)
     pos = tl.load(POS + token)
+    dx_ty = DX.dtype.element_ty
+    # The inverse rotation reads the FP32 table, matching the CUDA backward: the
+    # forward rotates with the declared-dtype table (RFC #435), but a
+    # declared-dtype table in the VJP pushes dW past the WS1 bf16 gradient cell.
     cosine = tl.load(COS + pos * 64 + d)
     sine = tl.load(SIN + pos * 64 + d)
 
@@ -151,7 +165,6 @@ def _mot_qk_norm_rope_bwd_kernel(
     coeff = ((((dot * r) * r) * r) / 128.0).to(tl.float32)
     dx_lo = (r * dy_lo) * w_lo - x_lo * coeff
     dx_hi = (r * dy_hi) * w_hi - x_hi * coeff
-    dx_ty = DX.dtype.element_ty
     tl.store(DX + base + d, dx_lo.to(dx_ty))
     tl.store(DX + base + d + 64, dx_hi.to(dx_ty))
     tl.store(DW_CONTRIB + base + d, (dy_lo * x_lo) * r)
